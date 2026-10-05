@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = QianmianEnhancer
 QianmianEnhancer_FILES = Tweak.xm QMEnhancerView.m
-QianmianEnhancer_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+QianmianEnhancer_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-const-variable -Wno-unused-variable
 QianmianEnhancer_FRAMEWORKS = UIKit CoreVideo CoreImage CoreGraphics QuartzCore
 QianmianEnhancer_LIBRARIES = substrate
 
