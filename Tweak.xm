@@ -1,9 +1,10 @@
 // ============================================================
-// VCamEnhancer · 主 Tweak
+// QianmianEnhancer · 主 Tweak
 //   ① 帧钩子（旋转 + 缩放）
 //   ② %hook LocalVideoPlayer（调用链保留）
-//   ③ %hook SpringBoard（UI 挂载）
-//   ④ %ctor（mark + 1 秒后装帧钩子）
+//   ③ VCamGetSettingsVC：视图层级反查（跟老代码一致）
+//   ④ %hook SpringBoard（UI 挂载）
+//   ⑤ %ctor（mark + 1 秒后装帧钩子）
 // ============================================================
 
 #import <Foundation/Foundation.h>
@@ -154,6 +155,70 @@ static void VPMInstallFrameHook(void) {
         VPMFrameInstalled = YES;
     } @catch (NSException *e) {}
 }
+
+// ------------------------------------------------------------
+// VCamGetSettingsVC：视图层级反查（跟老代码 VPMFindAllPanelEntries 一致）
+//   UI 层调用此函数拿原版 VCamSettingsViewController 实例
+//   走 responder 链反查，是原版插件唯一可靠的定位方式
+// ------------------------------------------------------------
+UIViewController *VCamGetSettingsVC(void) {
+    Class cls = NSClassFromString(@"VCamSettingsViewController");
+    if (!cls) return nil;
+
+    @try {
+        // 方式 1：遍历所有 window 的视图层级，沿 responder 链反查 VC
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            NSMutableArray *stack = [NSMutableArray arrayWithArray:[w subviews]];
+            int steps = 0;
+            while (stack.count && steps < 8000) {
+                steps++;
+                UIView *v = [stack lastObject];
+                [stack removeLastObject];
+
+                // 沿 responder 链向上反查
+                UIResponder *r = v;
+                int depth = 0;
+                while (r && depth < 12) {
+                    if ([r isKindOfClass:cls]) return (UIViewController *)r;
+                    r = r.nextResponder;
+                    depth++;
+                }
+
+                for (UIView *c in v.subviews) [stack addObject:c];
+            }
+        }
+
+        // 方式 2：rootVC → presentedVC 链（兜底）
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            UIViewController *vc = w.rootViewController;
+            int guard = 0;
+            while (vc && guard++ < 16) {
+                if ([vc isKindOfClass:cls]) return vc;
+                // 递归 childVC
+                NSMutableArray *vstack = [NSMutableArray arrayWithObject:vc];
+                while (vstack.count) {
+                    UIViewController *cur = [vstack lastObject];
+                    [vstack removeLastObject];
+                    for (UIViewController *c in cur.childViewControllers) {
+                        if ([c isKindOfClass:cls]) return c;
+                        [vstack addObject:c];
+                    }
+                }
+                vc = vc.presentedViewController;
+            }
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[VCamEnhancer] VCamGetSettingsVC 异常: %@", e);
+    }
+    return nil;
+}
+
+// 前向声明：编译期让 UI 层的 performSelector 通过
+@interface VCamSettingsViewController : UIViewController
+- (void)switchVideoTapped;
+- (void)restoreCameraTapped;
+- (void)toggleFloatingBallTapped;
+@end
 
 // ------------------------------------------------------------
 // ① %hook LocalVideoPlayer（调用链保留）
