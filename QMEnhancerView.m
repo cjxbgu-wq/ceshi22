@@ -5,8 +5,10 @@ static NSString *const kQMSharedSettingsPath = @"/tmp/vcam_enhancer_settings.pli
 static NSString *const kQMRotationKey        = @"videoRotationLV";
 static NSString *const kQMLegacyRotationKey  = @"videoRotation";
 static NSString *const kQMScaleKey           = @"videoScaleLV";
+
 static const CGFloat kQMScaleSteps[4] = {1.0f, 1.5f, 2.0f, 0.8f};
-static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_ball.png";
+
+#pragma mark - 按压反馈按钮
 
 @interface VPMPressButton : UIButton @end
 @implementation VPMPressButton
@@ -32,130 +34,40 @@ static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_b
 }
 @end
 
+#pragma mark - QMEnhancerView
+
 @interface QMEnhancerView ()
 
-// 悬浮球模式（在 SpringBoard 上）
-@property (nonatomic, strong) UIView *ball;
-
-// 面板模式（被挂到 VCamSettingsViewController 上时用）
 @property (nonatomic, strong) UIButton *tabControl;
 @property (nonatomic, strong) UIButton *tabCardkey;
 @property (nonatomic, strong) UIButton *tabNumeric;
 @property (nonatomic, assign) NSInteger currentTab;
-@property (nonatomic, strong) UIView *pageControl;
+
+@property (nonatomic, strong) UIView   *pageControl;
 @property (nonatomic, strong) UIButton *pickBtn;
 @property (nonatomic, strong) UIButton *banBtn;
 @property (nonatomic, strong) UIButton *rotBtn;
 @property (nonatomic, strong) UIButton *scaleBtn;
 @property (nonatomic, strong) UIButton *closeBtn;
-@property (nonatomic, strong) UIView *pageCardkey;
-@property (nonatomic, strong) UIView *pageNumeric;
 
-@property (nonatomic, assign) BOOL isBallMode;
-@property (nonatomic, assign) CGPoint dragStart;
+@property (nonatomic, strong) UIView   *pageCardkey;
+@property (nonatomic, strong) UIView   *pageNumeric;
 
 @end
 
 @implementation QMEnhancerView
 
-+ (instancetype)sharedInstance {
-    static QMEnhancerView *inst = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        inst = [[QMEnhancerView alloc] initWithFrame:CGRectMake(0, 0, 60, 60)];
-        inst.isBallMode = YES;
-    });
-    return inst;
-}
-
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        self.backgroundColor = [UIColor clearColor];
-        // 悬浮球模式默认只显示球
-        if (self.isBallMode || frame.size.width <= 60) {
-            [self buildBall];
-        } else {
-            [self buildPanel];
-        }
+        self.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
+        _currentTab = 0;
+        [self buildUI];
     }
     return self;
 }
 
-#pragma mark - 悬浮球 UI
-
-- (void)buildBall {
-    _ball = [[UIView alloc] initWithFrame:self.bounds];
-    _ball.backgroundColor = [UIColor clearColor];
-    _ball.userInteractionEnabled = YES;
-    _ball.layer.cornerRadius = self.bounds.size.width / 2;
-    _ball.layer.masksToBounds = NO;
-    _ball.layer.shadowColor = [UIColor colorWithRed:0.3 green:0.75 blue:1.0 alpha:1.0].CGColor;
-    _ball.layer.shadowRadius = 10.0;
-    _ball.layer.shadowOpacity = 0.7;
-    _ball.layer.shadowOffset = CGSizeZero;
-    [self addSubview:_ball];
-
-    UIImage *foxImg = [UIImage imageWithContentsOfFile:kQMFoxBallPath];
-    if (!foxImg) foxImg = [UIImage imageNamed:@"fox_ball"];
-    if (foxImg) {
-        UIImageView *iv = [[UIImageView alloc] initWithFrame:_ball.bounds];
-        iv.image = foxImg;
-        iv.contentMode = UIViewContentModeScaleAspectFill;
-        iv.layer.cornerRadius = _ball.bounds.size.width / 2;
-        iv.layer.masksToBounds = YES;
-        [_ball addSubview:iv];
-    } else {
-        CAGradientLayer *grad = [CAGradientLayer layer];
-        grad.frame = _ball.bounds;
-        grad.cornerRadius = _ball.bounds.size.width / 2;
-        grad.colors = @[
-            (id)[UIColor colorWithRed:0.70 green:0.92 blue:1.00 alpha:1].CGColor,
-            (id)[UIColor colorWithRed:0.35 green:0.70 blue:0.95 alpha:1].CGColor,
-            (id)[UIColor colorWithRed:0.10 green:0.35 blue:0.70 alpha:1].CGColor
-        ];
-        grad.startPoint = CGPointMake(0.3, 0.1);
-        grad.endPoint   = CGPointMake(0.7, 1.0);
-        [_ball.layer addSublayer:grad];
-
-        UILabel *fox = [[UILabel alloc] initWithFrame:_ball.bounds];
-        fox.text = @"🦊";
-        fox.font = [UIFont systemFontOfSize:28];
-        fox.textAlignment = NSTextAlignmentCenter;
-        [_ball addSubview:fox];
-    }
-
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
-                                   initWithTarget:self action:@selector(onBallTapped)];
-    [_ball addGestureRecognizer:tap];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
-                                   initWithTarget:self action:@selector(onDrag:)];
-    [_ball addGestureRecognizer:pan];
-}
-
-- (void)onBallTapped {
-    NSLog(@"[VCamEnhancer] 悬浮球被点击，弹出原版面板");
-    VCamShowSettingsPanel();
-}
-
-- (void)onDrag:(UIPanGestureRecognizer *)pan {
-    UIView *sv = self.superview;
-    if (!sv) return;
-    CGPoint t = [pan translationInView:sv];
-    if (pan.state == UIGestureRecognizerStateBegan) _dragStart = self.center;
-    CGPoint c = CGPointMake(_dragStart.x + t.x, _dragStart.y + t.y);
-    CGFloat m = 30;
-    c.x = MAX(m, MIN(sv.bounds.size.width  - m, c.x));
-    c.y = MAX(m, MIN(sv.bounds.size.height - m, c.y));
-    self.center = c;
-}
-
-#pragma mark - 面板 UI（挂到 VCamSettingsViewController 上时）
-
-- (void)buildPanel {
-    self.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
-    _currentTab = 0;
-
+- (void)buildUI {
     CGFloat pw = 320, ph = 300;
     CGFloat sx = (self.bounds.size.width  - pw) / 2.0;
     CGFloat sy = (self.bounds.size.height - ph) / 2.0;
@@ -163,7 +75,7 @@ static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_b
     if (sy < 60) sy = 60;
 
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(sx, sy, pw, ph)];
-    panel.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.98];
+    panel.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.98];
     panel.layer.cornerRadius = 12;
     panel.layer.borderWidth = 1;
     panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
@@ -175,12 +87,16 @@ static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_b
     tabBar.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
     [panel addSubview:tabBar];
 
-    _tabControl = [self makeTab:@"控制" x:0 tag:0];
-    _tabCardkey = [self makeTab:@"卡密" x:pw/3.0 tag:1];
-    _tabNumeric = [self makeTab:@"数字" x:2*pw/3.0 tag:2];
+    _tabControl = [self makeTab:@"控制" x:0        tag:0 pw:pw];
+    _tabCardkey = [self makeTab:@"卡密" x:pw/3.0   tag:1 pw:pw];
+    _tabNumeric = [self makeTab:@"数字" x:2*pw/3.0 tag:2 pw:pw];
     [tabBar addSubview:_tabControl];
     [tabBar addSubview:_tabCardkey];
     [tabBar addSubview:_tabNumeric];
+
+    UIView *tabLine = [[UIView alloc] initWithFrame:CGRectMake(0, 35, pw, 1)];
+    tabLine.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
+    [tabBar addSubview:tabLine];
 
     CGRect pageFrame = CGRectMake(0, 36, pw, ph - 36);
     _pageControl = [[UIView alloc] initWithFrame:pageFrame];
@@ -197,9 +113,9 @@ static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_b
     [self selectTab:0];
 }
 
-- (UIButton *)makeTab:(NSString *)title x:(CGFloat)x tag:(NSInteger)tag {
+- (UIButton *)makeTab:(NSString *)title x:(CGFloat)x tag:(NSInteger)tag pw:(CGFloat)pw {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = CGRectMake(x, 0, 320.0/3.0, 36);
+    b.frame = CGRectMake(x, 0, pw / 3.0, 36);
     b.tag = tag;
     [b setTitle:title forState:UIControlStateNormal];
     [b setTitleColor:[UIColor colorWithWhite:0.7 alpha:1] forState:UIControlStateNormal];
@@ -207,6 +123,7 @@ static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_b
     [b addTarget:self action:@selector(onTabTapped:) forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
+
 - (void)onTabTapped:(UIButton *)sender { [self selectTab:sender.tag]; }
 
 - (void)selectTab:(NSInteger)idx {
@@ -214,15 +131,24 @@ static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_b
     _pageControl.hidden = (idx != 0);
     _pageCardkey.hidden = (idx != 1);
     _pageNumeric.hidden = (idx != 2);
+
     UIColor *on  = [UIColor colorWithRed:0.2 green:0.7 blue:1.0 alpha:1];
     UIColor *off = [UIColor colorWithWhite:0.7 alpha:1];
     [_tabControl setTitleColor:(idx == 0 ? on : off) forState:UIControlStateNormal];
     [_tabCardkey setTitleColor:(idx == 1 ? on : off) forState:UIControlStateNormal];
     [_tabNumeric setTitleColor:(idx == 2 ? on : off) forState:UIControlStateNormal];
+    _tabControl.titleLabel.font = [UIFont systemFontOfSize:13 weight:(idx == 0 ? UIFontWeightBold : UIFontWeightMedium)];
+    _tabCardkey.titleLabel.font = [UIFont systemFontOfSize:13 weight:(idx == 1 ? UIFontWeightBold : UIFontWeightMedium)];
+    _tabNumeric.titleLabel.font = [UIFont systemFontOfSize:13 weight:(idx == 2 ? UIFontWeightBold : UIFontWeightMedium)];
 }
 
 - (void)buildControlPage:(CGFloat)pw {
-    CGFloat w = pw - 20, y = 10, rowH = 44, gap = 6, x = 10;
+    CGFloat w = pw - 20;
+    CGFloat y = 10;
+    CGFloat rowH = 44;
+    CGFloat gap = 6;
+    CGFloat x = 10;
+
     _pickBtn = [self makeRow:@"📁   选择内容" color:[UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:1]
                        frame:CGRectMake(x, y, w, rowH) selector:@selector(onPickVideo)];
     y += rowH + gap;
@@ -237,6 +163,7 @@ static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_b
     y += rowH + gap;
     _closeBtn = [self makeRow:@"▾   收起菜单" color:[UIColor colorWithRed:0.55 green:0.5 blue:0.7 alpha:1]
                         frame:CGRectMake(x, y, w, rowH) selector:@selector(onHideFloatingBall)];
+
     [_pageControl addSubview:_pickBtn];
     [_pageControl addSubview:_banBtn];
     [_pageControl addSubview:_rotBtn];
@@ -260,16 +187,21 @@ static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_b
     return b;
 }
 
+#pragma mark - 转发到原版 VC（照抄老代码）
+
 - (void)callPanelSelector:(SEL)sel title:(NSString *)title {
     UIViewController *vc = self.panelVC;
     if (!vc) { NSLog(@"[VCamEnhancer] ❌ %@: panelVC nil", title); return; }
-    if (![vc respondsToSelector:sel]) { NSLog(@"[VCamEnhancer] ❌ %@: 无方法", title); return; }
+    if (![vc respondsToSelector:sel]) {
+        NSLog(@"[VCamEnhancer] ❌ %@: 原版 VC 无方法 %@", title, NSStringFromSelector(sel));
+        return;
+    }
     @try {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
         [vc performSelector:sel];
 #pragma clang diagnostic pop
-        NSLog(@"[VCamEnhancer] ✅ %@ 已调用", title);
+        NSLog(@"[VCamEnhancer] ✅ %@ 已转发到原版 VC", title);
     } @catch (NSException *e) {
         NSLog(@"[VCamEnhancer] ❌ %@ 异常: %@", title, e);
     }
@@ -286,13 +218,15 @@ static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_b
     s[kQMLegacyRotationKey] = @(0);
     [self writeSettings:s];
 }
+
 - (void)onScale {
     NSMutableDictionary *s = [NSMutableDictionary dictionaryWithDictionary:[self readSettings]];
     CGFloat cur = [self currentScale];
     NSInteger idx = 0;
     for (NSInteger i = 0; i < 4; i++)
         if (fabs(kQMScaleSteps[i] - cur) < 0.01f) { idx = i; break; }
-    s[kQMScaleKey] = @(kQMScaleSteps[(idx + 1) % 4]);
+    NSInteger next = (idx + 1) % 4;
+    s[kQMScaleKey] = @(kQMScaleSteps[next]);
     [self writeSettings:s];
 }
 
@@ -313,33 +247,5 @@ static NSString *const kQMFoxBallPath = @"/var/mobile/Library/VCamEnhancer/fox_b
 }
 
 + (void)processFrame:(CVPixelBufferRef)pixelBuffer { (void)pixelBuffer; }
-
-- (void)showInWindow:(UIWindow *)window {
-    if (self.superview) [self removeFromSuperview];
-    self.frame = CGRectMake(15, window.bounds.size.height / 2, 60, 60);
-    [window addSubview:self];
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(reAdd)
-                                                 name:UIApplicationDidBecomeActiveNotification
-                                               object:nil];
-    [NSTimer scheduledTimerWithTimeInterval:5.0 target:self
-                                   selector:@selector(reAdd) userInfo:nil repeats:YES];
-}
-- (void)reAdd {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *w = nil;
-        for (UIWindow *x in [UIApplication sharedApplication].windows) {
-            if (x.isKeyWindow) { w = x; break; }
-        }
-        if (!w) return;
-        if (self.superview != w) {
-            [self removeFromSuperview];
-            [w addSubview:self];
-        }
-        [w bringSubviewToFront:self];
-    });
-}
-
-- (void)toggleVisibility { self.hidden = !self.hidden; }
 
 @end
