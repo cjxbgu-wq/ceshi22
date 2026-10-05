@@ -1,13 +1,11 @@
 // ============================================================
 // QianmianEnhancer · 主 Tweak
-// 完全照抄老代码 VCamExtraKeys.xm 机制：
-//   ① %hook VCamSettingsViewController.viewDidLoad
-//      → 清空原版 UI，挂我们的简化面板
-//      → 面板按钮 target = 原版 VC（self）
-//   ② %hook LocalVideoPlayer.updateCurrentBuffer:
-//      → 帧处理（旋转 + 缩放）
-//   ③ %ctor 里 1 秒延迟装帧钩子
-// 不 hook SpringBoard，不加悬浮球，不改任何原版入口。
+// 完全照抄老代码 VCamExtraKeys.xm 的面板接管机制：
+//   ① VPMSchedulePanelInstall 轮询（每秒 1 次，最多 60 次）
+//   ② VPMInstallPanelHooks 用 method_setImplementation 装 hook
+//   ③ VPMSettingsViewDidLoad 里清空原版 UI，挂我们的面板
+//   ④ 面板按钮 target = 原版 VC（self），转发原版 SEL
+//   ⑤ 帧钩子（旋转 + 缩放）
 // ============================================================
 
 #import <Foundation/Foundation.h>
@@ -19,6 +17,15 @@
 #import <stdlib.h>
 #import <objc/runtime.h>
 #import "QMEnhancerView.h"
+
+// ============ 日志宏 ============
+#define VLOG(fmt, ...) do { \
+    NSString *__s = [NSString stringWithFormat:(fmt), ##__VA_ARGS__]; \
+    NSLog(@"[VCamEnhancer] %@", __s); \
+    NSString *__old = [NSString stringWithContentsOfFile:@"/tmp/vcam_enhancer.log" encoding:NSUTF8StringEncoding error:nil]; \
+    NSString *__new = [NSString stringWithFormat:@"%@%@\n", __old ?: @"", __s]; \
+    [__new writeToFile:@"/tmp/vcam_enhancer.log" atomically:YES encoding:NSUTF8StringEncoding error:nil]; \
+} while(0)
 
 static NSString *const VPMSharedSettingsPath = @"/tmp/vcam_enhancer_settings.plist";
 static NSString *const VPMRotationKey        = @"videoRotationLV";
@@ -32,18 +39,16 @@ static NSDictionary *VPMReadSettings(void) {
     } @catch (NSException *e) {}
     return @{};
 }
-
 static NSInteger VPMReadRotation(void) {
     NSInteger r = [[VPMReadSettings() objectForKey:VPMRotationKey] integerValue];
     return (r == 90 || r == 180 || r == 270) ? r : 0;
 }
-
 static CGFloat VPMReadScale(void) {
     CGFloat s = [[VPMReadSettings() objectForKey:VPMScaleKey] floatValue];
     return (s > 0.05f && s < 20.0f) ? s : 1.0f;
 }
 
-// ============ 帧处理：旋转 + 缩放（照抄老代码）============
+// ============ 帧处理（照抄）============
 static uint8_t *gRotSnap = NULL;
 static size_t   gRotSnapCap = 0;
 
@@ -107,7 +112,7 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat sc
     } @catch (NSException *e) {}
 }
 
-// ============ 帧钩子（照抄老代码）============
+// ============ 帧钩子（照抄）============
 static void (*origUpdateCurrentBuffer)(id, SEL, CVBufferRef) = NULL;
 static volatile int64_t VPMFramesSeen = 0;
 
@@ -115,8 +120,8 @@ static void VPMUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
     @try {
         int64_t seen = __sync_add_and_fetch(&VPMFramesSeen, 1);
         if (seen == 1 && buffer) {
-            NSLog(@"[VCamEnhancer] 首帧 %zux%zu",
-                  CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer));
+            VLOG(@"帧钩子首帧 %zux%zu",
+                 CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer));
         }
         static NSInteger cachedRot = -1;
         static CGFloat   cachedScale = -1.0;
@@ -141,69 +146,151 @@ static void VPMInstallFrameHook(void) {
     if (VPMFrameInstalled) return;
     @try {
         Class lvp = NSClassFromString(@"LocalVideoPlayer");
-        if (!lvp) return;
+        if (!lvp) { VLOG(@"⚠️ LocalVideoPlayer 类不存在，等下次"); return; }
         Method m = class_getInstanceMethod(lvp, @selector(updateCurrentBuffer:));
-        if (!m) return;
+        if (!m) { VLOG(@"⚠️ updateCurrentBuffer: 方法不存在"); return; }
         IMP orig = method_getImplementation(m);
         if (orig == (IMP)VPMUpdateCurrentBufferHook) { VPMFrameInstalled = YES; return; }
         origUpdateCurrentBuffer = (void (*)(id, SEL, CVBufferRef))orig;
         method_setImplementation(m, (IMP)VPMUpdateCurrentBufferHook);
         VPMFrameInstalled = YES;
-        NSLog(@"[VCamEnhancer] 帧钩子已安装");
-    } @catch (NSException *e) {}
-}
-
-// ============ 接管原版面板 UI（照抄老代码核心）============
-@interface VCamSettingsViewController : UIViewController
-- (void)switchVideoTapped;
-- (void)restoreCameraTapped;
-- (void)toggleFloatingBallTapped;
-- (void)dismissPanel;
-@end
-
-%hook VCamSettingsViewController
-
-- (void)viewDidLoad {
-    %orig;
-    NSLog(@"[VCamEnhancer] ✅ viewDidLoad 已捕获，接管 UI");
-
-    // 照抄老代码：清空原版 UI
-    for (UIView *v in [self.view.subviews copy]) [v removeFromSuperview];
-
-    // 挂我们的简化面板，把 self（原版 VC）传给面板，用作按钮 target
-    QMEnhancerView *panel = [[QMEnhancerView alloc] initWithFrame:self.view.bounds];
-    panel.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    panel.panelVC = self;
-    [self.view addSubview:panel];
-    NSLog(@"[VCamEnhancer] ✅ 简化面板已挂载，按钮 target = %@", [self class]);
-}
-
-%end
-
-// ============ %hook LocalVideoPlayer ============
-@interface LocalVideoPlayer : NSObject
-- (void)updateCurrentBuffer:(CVPixelBufferRef)buffer;
-@end
-
-%hook LocalVideoPlayer
-- (void)updateCurrentBuffer:(CVPixelBufferRef)buffer {
-    if (buffer) {
-        @try { [QMEnhancerView processFrame:buffer]; } @catch (NSException *e) {}
+        VLOG(@"✅ 帧钩子已安装");
+    } @catch (NSException *e) {
+        VLOG(@"❌ 帧钩子安装异常: %@", e);
     }
-    %orig;
 }
+
+// ============================================================
+// 面板接管（完全照抄老代码的机制）
+// ============================================================
+static void (*origSettingsViewDidLoad)(id, SEL) = NULL;
+
+// 照抄老代码 VPMSettingsViewDidLoad
+static void VPMSettingsViewDidLoad(id self, SEL _cmd) {
+    @try {
+        VLOG(@"🟢 VCamSettingsViewController.viewDidLoad 被调用");
+
+        // 先跑原逻辑
+        if (origSettingsViewDidLoad) origSettingsViewDidLoad(self, _cmd);
+
+        UIViewController *vc = (UIViewController *)self;
+        UIView *root = vc.view;
+        if (!root) { VLOG(@"❌ root view 为 nil"); return; }
+
+        VLOG(@"   原版 view 有 %lu 个子视图", (unsigned long)root.subviews.count);
+
+        // 清空原版 UI
+        for (UIView *v in [root.subviews copy]) [v removeFromSuperview];
+
+        // 挂我们的面板
+        QMEnhancerView *panel = [[QMEnhancerView alloc] initWithFrame:root.bounds];
+        panel.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        panel.panelVC = vc;
+        [root addSubview:panel];
+        VLOG(@"✅ 简化面板已挂载到原版 VC");
+    } @catch (NSException *e) {
+        VLOG(@"❌ viewDidLoad 异常: %@", e);
+        if (origSettingsViewDidLoad) origSettingsViewDidLoad(self, _cmd);
+    }
+}
+
+// 照抄老代码 VPMInstallPanelHooks
+static BOOL VPMPanelHooked = NO;
+static void VPMInstallPanelHooks(void) {
+    if (VPMPanelHooked) return;
+    @try {
+        Class settings = NSClassFromString(@"VCamSettingsViewController");
+        if (!settings) return;  // 类还没加载，等下次轮询
+
+        Method m = class_getInstanceMethod(settings, @selector(viewDidLoad));
+        if (!m) { VLOG(@"⚠️ viewDidLoad 方法不存在"); return; }
+
+        IMP orig = method_getImplementation(m);
+        if (orig == (IMP)VPMSettingsViewDidLoad) {
+            VPMPanelHooked = YES;
+            return;
+        }
+        origSettingsViewDidLoad = (void (*)(id, SEL))orig;
+        method_setImplementation(m, (IMP)VPMSettingsViewDidLoad);
+        VPMPanelHooked = YES;
+        VLOG(@"✅ 面板 hook 已安装 (method_setImplementation)");
+    } @catch (NSException *e) {
+        VLOG(@"❌ 面板 hook 安装异常: %@", e);
+    }
+}
+
+// 照抄老代码 VPMSchedulePanelInstall
+static void VPMSchedulePanelInstall(void) {
+    VPMInstallPanelHooks();
+
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(src,
+                              dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                              1 * NSEC_PER_SEC,
+                              NSEC_PER_SEC);
+    __block int tries = 0;
+    dispatch_source_set_event_handler(src, ^{
+        @autoreleasepool {
+            @try {
+                if (VPMPanelHooked) {
+                    dispatch_source_cancel(src);
+                    return;
+                }
+                if (++tries >= 60) {
+                    VLOG(@"❌ 面板 hook 60 秒内未装成");
+                    dispatch_source_cancel(src);
+                    return;
+                }
+                VPMInstallPanelHooks();
+            } @catch (NSException *e) {}
+        }
+    });
+    dispatch_resume(src);
+}
+
+// ============================================================
+// SpringBoard 启动完成后开始轮询安装面板 hook
+// ============================================================
+%hook SpringBoard
+
+- (void)applicationDidFinishLaunching:(id)application {
+    %orig;
+    VLOG(@"SpringBoard 启动完成，开始轮询面板 hook");
+    VPMSchedulePanelInstall();
+}
+
 %end
 
-// ============ %ctor ============
+// ============================================================
+// %ctor
+// ============================================================
 %ctor {
     @autoreleasepool {
-        @try {
-            [@"ok" writeToFile:@"/tmp/vcam_enhancer_injected.txt"
-                    atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        } @catch (NSException *e) {}
+        [@"" writeToFile:@"/tmp/vcam_enhancer.log" atomically:YES
+                encoding:NSUTF8StringEncoding error:nil];
+
+        NSString *proc = [[NSProcessInfo processInfo] processName];
+        VLOG(@"========================================");
+        VLOG(@"VCamEnhancer dylib 已加载，进程=%@", proc);
+
+        Class vcClass = NSClassFromString(@"VCamSettingsViewController");
+        Class lvClass = NSClassFromString(@"LocalVideoPlayer");
+        VLOG(@"VCamSettingsViewController: %@", vcClass ? @"存在" : @"不存在（稍后轮询）");
+        VLOG(@"LocalVideoPlayer: %@", lvClass ? @"存在" : @"不存在（稍后轮询）");
+        VLOG(@"========================================");
+
+        // 帧钩子：1 秒后装
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             VPMInstallFrameHook();
         });
+
+        // 面板 hook：立即尝试一次（SpringBoard 里有效）
+        if ([proc isEqualToString:@"SpringBoard"]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                VPMSchedulePanelInstall();
+            });
+        }
     }
 }
