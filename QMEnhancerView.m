@@ -26,32 +26,26 @@ static NSString *const kQMFoxBallPath =
 @end
 
 @implementation VPMPressButton
-
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesBegan:touches withEvent:event];
-    [UIView animateWithDuration:0.08 delay:0 options:UIViewAnimationOptionCurveEaseOut
-                     animations:^{
+    [UIView animateWithDuration:0.08 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
         self.transform = CGAffineTransformMakeScale(0.94, 0.94);
         self.alpha = 0.8;
     } completion:nil];
 }
-
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesEnded:touches withEvent:event];
     [UIView animateWithDuration:0.18 delay:0 usingSpringWithDamping:0.55 initialSpringVelocity:0.8
-                        options:UIViewAnimationOptionCurveEaseOut
-                     animations:^{
+                        options:UIViewAnimationOptionCurveEaseOut animations:^{
         self.transform = CGAffineTransformIdentity;
         self.alpha = 1.0;
     } completion:nil];
 }
-
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesCancelled:touches withEvent:event];
     self.transform = CGAffineTransformIdentity;
     self.alpha = 1.0;
 }
-
 @end
 
 #pragma mark - QMEnhancerView
@@ -122,7 +116,6 @@ static NSString *const kQMFoxBallPath =
 
     UIImage *foxImg = [UIImage imageWithContentsOfFile:kQMFoxBallPath];
     if (!foxImg) foxImg = [UIImage imageNamed:@"fox_ball"];
-
     if (foxImg) {
         UIImageView *iv = [[UIImageView alloc] initWithFrame:_ball.bounds];
         iv.image = foxImg;
@@ -153,7 +146,6 @@ static NSString *const kQMFoxBallPath =
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
                                    initWithTarget:self action:@selector(togglePanel)];
     [_ball addGestureRecognizer:tap];
-
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
                                    initWithTarget:self action:@selector(onDrag:)];
     [_ball addGestureRecognizer:pan];
@@ -196,7 +188,6 @@ static NSString *const kQMFoxBallPath =
     [_panel addSubview:_pageNumeric];
 
     [self buildControlPage];
-
     [self selectTab:0];
     [self refreshAll];
 }
@@ -214,9 +205,7 @@ static NSString *const kQMFoxBallPath =
     return b;
 }
 
-- (void)onTabTapped:(UIButton *)sender {
-    [self selectTab:sender.tag];
-}
+- (void)onTabTapped:(UIButton *)sender { [self selectTab:sender.tag]; }
 
 - (void)selectTab:(NSInteger)idx {
     _currentTab = idx;
@@ -229,13 +218,9 @@ static NSString *const kQMFoxBallPath =
     [_tabControl setTitleColor:(idx == 0 ? on : off) forState:UIControlStateNormal];
     [_tabCardkey setTitleColor:(idx == 1 ? on : off) forState:UIControlStateNormal];
     [_tabNumeric setTitleColor:(idx == 2 ? on : off) forState:UIControlStateNormal];
-
-    _tabControl.titleLabel.font = [UIFont systemFontOfSize:13
-                                       weight:(idx == 0 ? UIFontWeightBold : UIFontWeightMedium)];
-    _tabCardkey.titleLabel.font = [UIFont systemFontOfSize:13
-                                       weight:(idx == 1 ? UIFontWeightBold : UIFontWeightMedium)];
-    _tabNumeric.titleLabel.font = [UIFont systemFontOfSize:13
-                                       weight:(idx == 2 ? UIFontWeightBold : UIFontWeightMedium)];
+    _tabControl.titleLabel.font = [UIFont systemFontOfSize:13 weight:(idx == 0 ? UIFontWeightBold : UIFontWeightMedium)];
+    _tabCardkey.titleLabel.font = [UIFont systemFontOfSize:13 weight:(idx == 1 ? UIFontWeightBold : UIFontWeightMedium)];
+    _tabNumeric.titleLabel.font = [UIFont systemFontOfSize:13 weight:(idx == 2 ? UIFontWeightBold : UIFontWeightMedium)];
 }
 
 #pragma mark - 页 1 · 控制
@@ -244,34 +229,20 @@ static NSString *const kQMFoxBallPath =
     CGFloat w = kQMPanelW - kQMPad * 2;
     CGFloat y = kQMPad;
 
-    _pickBtn = [self makeRow:@"📁   选择内容"
-                       color:[UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:1]
-                         frame:CGRectMake(kQMPad, y, w, kQMRowH)
-                      selector:@selector(onPickVideo)];
+    _pickBtn = [self makeRow:@"📁   选择内容" color:[UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:1]
+                       frame:CGRectMake(kQMPad, y, w, kQMRowH) selector:@selector(onPickVideo)];
     y += kQMRowH + kQMGap;
-
-    _banBtn = [self makeRow:@"⏸️   暂停显示"
-                      color:[UIColor colorWithRed:1.0 green:0.35 blue:0.35 alpha:1]
-                        frame:CGRectMake(kQMPad, y, w, kQMRowH)
-                     selector:@selector(onBanVideo)];
+    _banBtn = [self makeRow:@"⏸️   暂停显示" color:[UIColor colorWithRed:1.0 green:0.35 blue:0.35 alpha:1]
+                      frame:CGRectMake(kQMPad, y, w, kQMRowH) selector:@selector(onBanVideo)];
     y += kQMRowH + kQMGap;
-
-    _rotBtn = [self makeRow:@"↻   调整方向"
-                      color:[UIColor colorWithRed:0.3 green:0.75 blue:1.0 alpha:1]
-                        frame:CGRectMake(kQMPad, y, w, kQMRowH)
-                     selector:@selector(onRotate)];
+    _rotBtn = [self makeRow:@"↻   调整方向" color:[UIColor colorWithRed:0.3 green:0.75 blue:1.0 alpha:1]
+                      frame:CGRectMake(kQMPad, y, w, kQMRowH) selector:@selector(onRotate)];
     y += kQMRowH + kQMGap;
-
-    _scaleBtn = [self makeRow:@"⇲   适配大小"
-                        color:[UIColor colorWithRed:0.7 green:0.4 blue:1.0 alpha:1]
-                          frame:CGRectMake(kQMPad, y, w, kQMRowH)
-                       selector:@selector(onScale)];
+    _scaleBtn = [self makeRow:@"⇲   适配大小" color:[UIColor colorWithRed:0.7 green:0.4 blue:1.0 alpha:1]
+                        frame:CGRectMake(kQMPad, y, w, kQMRowH) selector:@selector(onScale)];
     y += kQMRowH + kQMGap;
-
-    _closeBtn = [self makeRow:@"▾   收起菜单"
-                        color:[UIColor colorWithRed:0.55 green:0.5 blue:0.7 alpha:1]
-                          frame:CGRectMake(kQMPad, y, w, kQMRowH)
-                       selector:@selector(onHideFloatingBall)];
+    _closeBtn = [self makeRow:@"▾   收起菜单" color:[UIColor colorWithRed:0.55 green:0.5 blue:0.7 alpha:1]
+                        frame:CGRectMake(kQMPad, y, w, kQMRowH) selector:@selector(onHideFloatingBall)];
 
     [_pageControl addSubview:_pickBtn];
     [_pageControl addSubview:_banBtn];
@@ -304,17 +275,17 @@ static NSString *const kQMFoxBallPath =
     if (_panelOpen) [self refreshAll];
 }
 
-#pragma mark - 转发到原版面板（视图层级反查，跟老代码一致）
+#pragma mark - 转发到原版面板（照抄老代码思路）
 
 - (void)callPanelSelector:(SEL)sel title:(NSString *)title {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *vc = VCamGetSettingsVC();
         if (!vc) {
-            NSLog(@"[VCamEnhancer] %@：未找到原版面板 VC（需先打开过原版面板）", title);
+            NSLog(@"[VCamEnhancer] ❌ %@：未找到原版 VC（需先打开一次原版面板）", title);
             return;
         }
         if (![vc respondsToSelector:sel]) {
-            NSLog(@"[VCamEnhancer] %@：VC 无该方法", title);
+            NSLog(@"[VCamEnhancer] ❌ %@：VC 无该方法", title);
             return;
         }
         @try {
@@ -322,9 +293,9 @@ static NSString *const kQMFoxBallPath =
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
             [vc performSelector:sel];
 #pragma clang diagnostic pop
-            NSLog(@"[VCamEnhancer] %@：已转发到原版面板", title);
+            NSLog(@"[VCamEnhancer] ✅ %@：已转发到原版面板", title);
         } @catch (NSException *e) {
-            NSLog(@"[VCamEnhancer] %@：异常 %@", title, e);
+            NSLog(@"[VCamEnhancer] ❌ %@ 异常: %@", title, e);
         }
     });
 }
@@ -377,11 +348,7 @@ static NSString *const kQMFoxBallPath =
     return (s > 0.05f && s < 20.0f) ? s : 1.0f;
 }
 
-#pragma mark - 刷新 UI
-
-- (void)refreshAll {
-    // 按钮名字固定，不随旋转/缩放数值变化
-}
+- (void)refreshAll { }
 
 #pragma mark - 点击修复
 
@@ -413,11 +380,7 @@ static NSString *const kQMFoxBallPath =
     UIView *sv = self.superview;
     if (!sv) return;
     CGPoint t = [pan translationInView:sv];
-
-    if (pan.state == UIGestureRecognizerStateBegan) {
-        _dragStart = self.center;
-    }
-
+    if (pan.state == UIGestureRecognizerStateBegan) _dragStart = self.center;
     CGPoint c = CGPointMake(_dragStart.x + t.x, _dragStart.y + t.y);
     CGFloat m = 30;
     c.x = MAX(m, MIN(sv.bounds.size.width  - m, c.x));
@@ -435,7 +398,6 @@ static NSString *const kQMFoxBallPath =
 
 - (void)showInWindow:(UIWindow *)window {
     if (self.superview) [self removeFromSuperview];
-
     self.frame = CGRectMake(15, window.bounds.size.height / 2, 60, 60);
     [window addSubview:self];
 
@@ -463,8 +425,6 @@ static NSString *const kQMFoxBallPath =
     });
 }
 
-- (void)toggleVisibility {
-    self.hidden = !self.hidden;
-}
+- (void)toggleVisibility { self.hidden = !self.hidden; }
 
 @end
