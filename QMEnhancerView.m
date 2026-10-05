@@ -3,14 +3,13 @@
 
 #pragma mark - 常量
 
-static NSString *const kQMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings.plist";
+static NSString *const kQMSharedSettingsPath = @"/tmp/vcam_enhancer_settings.plist";
 static NSString *const kQMRotationKey        = @"videoRotationLV";
 static NSString *const kQMLegacyRotationKey  = @"videoRotation";
 static NSString *const kQMScaleKey           = @"videoScaleLV";
 
 static const CGFloat kQMScaleSteps[4] = {1.0f, 1.5f, 2.0f, 0.8f};
 
-// 面板尺寸（统一常量）
 static const CGFloat kQMPanelW = 240.0;
 static const CGFloat kQMPanelH = 284.0;
 static const CGFloat kQMTabH   = 36.0;
@@ -18,9 +17,9 @@ static const CGFloat kQMPad    = 10.0;
 static const CGFloat kQMRowH   = 40.0;
 static const CGFloat kQMGap    = 6.0;
 
-// 悬浮球图片路径
+// 图片路径改到 /var/mobile（rootless 下可写）
 static NSString *const kQMFoxBallPath =
-    @"/var/mobile/Library/Application Support/QianmianEnhancer/fox_ball.png";
+    @"/var/mobile/Library/VCamEnhancer/fox_ball.png";
 
 #pragma mark - QMEnhancerView
 
@@ -76,7 +75,6 @@ static NSString *const kQMFoxBallPath =
 #pragma mark - 构建 UI
 
 - (void)buildUI {
-    // ============ 悬浮球（蓝色玻璃球 + 狐狸头） ============
     _ball = [[UIView alloc] initWithFrame:self.bounds];
     _ball.backgroundColor = [UIColor clearColor];
     _ball.userInteractionEnabled = YES;
@@ -99,7 +97,6 @@ static NSString *const kQMFoxBallPath =
         iv.layer.masksToBounds = YES;
         [_ball addSubview:iv];
     } else {
-        // 无图降级：蓝玻璃底 + 🦊
         CAGradientLayer *grad = [CAGradientLayer layer];
         grad.frame = _ball.bounds;
         grad.cornerRadius = _ball.bounds.size.width / 2;
@@ -127,7 +124,6 @@ static NSString *const kQMFoxBallPath =
                                    initWithTarget:self action:@selector(onDrag:)];
     [_ball addGestureRecognizer:pan];
 
-    // ================= 面板容器 =================
     _panel = [[UIView alloc] initWithFrame:CGRectMake(70, -kQMPanelH / 2, kQMPanelW, kQMPanelH)];
     _panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.95];
     _panel.layer.cornerRadius = 12;
@@ -136,7 +132,6 @@ static NSString *const kQMFoxBallPath =
     _panel.hidden = YES;
     [self addSubview:_panel];
 
-    // Tab 栏
     UIView *tabBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kQMPanelW, kQMTabH)];
     tabBar.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1.0];
     tabBar.layer.cornerRadius = 12;
@@ -154,7 +149,6 @@ static NSString *const kQMFoxBallPath =
     tabLine.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
     [tabBar addSubview:tabLine];
 
-    // 三个页面
     CGRect pageFrame = CGRectMake(0, kQMTabH, kQMPanelW, kQMPanelH - kQMTabH);
     _pageControl = [[UIView alloc] initWithFrame:pageFrame];
     _pageCardkey = [[UIView alloc] initWithFrame:pageFrame];
@@ -209,7 +203,7 @@ static NSString *const kQMFoxBallPath =
                                        weight:(idx == 2 ? UIFontWeightBold : UIFontWeightMedium)];
 }
 
-#pragma mark - 页 1 · 控制（5 键整齐排列，收起菜单在最下）
+#pragma mark - 页 1 · 控制
 
 - (void)buildControlPage {
     CGFloat w = kQMPanelW - kQMPad * 2;
@@ -307,7 +301,7 @@ static NSString *const kQMFoxBallPath =
 - (void)callPanelSelector:(SEL)sel title:(NSString *)title {
     UIViewController *vc = [self findPanelVC];
     if (!vc || ![vc respondsToSelector:sel]) {
-        NSLog(@"[QianmianEnhancer] 面板 VC 未找到或无方法: %@", title);
+        NSLog(@"[VCamEnhancer] 面板 VC 未找到或无方法: %@", title);
         return;
     }
 #pragma clang diagnostic push
@@ -364,7 +358,7 @@ static NSString *const kQMFoxBallPath =
     return (s > 0.05f && s < 20.0f) ? s : 1.0f;
 }
 
-#pragma mark - 刷新 UI（按钮名固定无数字）
+#pragma mark - 刷新 UI
 
 - (void)refreshAll {
     // 按钮名字固定，不随旋转/缩放数值变化
