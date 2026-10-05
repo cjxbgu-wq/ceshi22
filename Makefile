@@ -1,13 +1,9 @@
-ARCHS = arm64 arm64e
-TARGET = iphone:clang:latest:15.0
-INSTALL_TARGET_PROCESSES = SpringBoard mediaserverd lskdd
-
-include $(THEOS)/makefiles/common.mk
-
-TWEAK_NAME = VCamEnhancer
-VCamEnhancer_FILES = Tweak.xm QMEnhancerView.m
-VCamEnhancer_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-const-variable -Wno-unused-variable
-VCamEnhancer_FRAMEWORKS = UIKit CoreVideo CoreImage CoreGraphics QuartzCore
-VCamEnhancer_LIBRARIES = substrate
-
-include $(THEOS_MAKE_PATH)/tweak.mk
+Package: com.vcamenhancer.pro
+Name: VCam 增强工具
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 视频方向旋转 + 视频缩放
+Maintainer: Enhancer
+Author: Enhancer
+Section: Tweaks
+Depends: mobilesubstrate, rootless-compat (>= 0.9)
