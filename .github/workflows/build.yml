@@ -1,0 +1,46 @@
+name: Build Qianmian Enhancer
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Tweak
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: brew install ldid xz gnu-tar dos2unix
+
+      - name: Setup Theos
+        run: |
+          export THEOS=$HOME/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          cd $THEOS && git submodule update --init --recursive
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
+
+      - name: Download iOS SDK
+        run: |
+          rm -rf $THEOS/sdks
+          git clone --depth 1 https://github.com/theos/sdks.git $THEOS/sdks
+
+      - name: Fix Line Endings
+        run: dos2unix control
+
+      - name: Build Package
+        run: |
+          export THEOS=$HOME/theos
+          make package FINALPACKAGE=1
+          ls -la packages/
+
+      - name: Upload DEB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QianmianEnhancer-deb
+          path: packages/*.deb
