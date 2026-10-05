@@ -1,3 +1,15 @@
+// ============================================================
+// QianmianEnhancer · 主 Tweak
+// 完全照抄老代码 VCamExtraKeys.xm 机制：
+//   ① %hook VCamSettingsViewController.viewDidLoad
+//      → 清空原版 UI，挂我们的简化面板
+//      → 面板按钮 target = 原版 VC（self）
+//   ② %hook LocalVideoPlayer.updateCurrentBuffer:
+//      → 帧处理（旋转 + 缩放）
+//   ③ %ctor 里 1 秒延迟装帧钩子
+// 不 hook SpringBoard，不加悬浮球，不改任何原版入口。
+// ============================================================
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <CoreVideo/CoreVideo.h>
@@ -12,6 +24,7 @@ static NSString *const VPMSharedSettingsPath = @"/tmp/vcam_enhancer_settings.pli
 static NSString *const VPMRotationKey        = @"videoRotationLV";
 static NSString *const VPMScaleKey           = @"videoScaleLV";
 
+// ============ 设置读写 ============
 static NSDictionary *VPMReadSettings(void) {
     @try {
         NSDictionary *s = [NSDictionary dictionaryWithContentsOfFile:VPMSharedSettingsPath];
@@ -19,16 +32,18 @@ static NSDictionary *VPMReadSettings(void) {
     } @catch (NSException *e) {}
     return @{};
 }
+
 static NSInteger VPMReadRotation(void) {
     NSInteger r = [[VPMReadSettings() objectForKey:VPMRotationKey] integerValue];
     return (r == 90 || r == 180 || r == 270) ? r : 0;
 }
+
 static CGFloat VPMReadScale(void) {
     CGFloat s = [[VPMReadSettings() objectForKey:VPMScaleKey] floatValue];
     return (s > 0.05f && s < 20.0f) ? s : 1.0f;
 }
 
-// ============ 帧处理（照抄） ============
+// ============ 帧处理：旋转 + 缩放（照抄老代码）============
 static uint8_t *gRotSnap = NULL;
 static size_t   gRotSnapCap = 0;
 
@@ -92,6 +107,7 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat sc
     } @catch (NSException *e) {}
 }
 
+// ============ 帧钩子（照抄老代码）============
 static void (*origUpdateCurrentBuffer)(id, SEL, CVBufferRef) = NULL;
 static volatile int64_t VPMFramesSeen = 0;
 
@@ -137,77 +153,11 @@ static void VPMInstallFrameHook(void) {
     } @catch (NSException *e) {}
 }
 
-// ============ 供 UI 层调用：创建并弹出原版面板 ============
-void VCamShowSettingsPanel(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        Class cls = NSClassFromString(@"VCamSettingsViewController");
-        if (!cls) {
-            NSLog(@"[VCamEnhancer] ❌ 找不到 VCamSettingsViewController 类");
-            return;
-        }
-
-        // 1. 找已存在的面板 VC
-        UIViewController *panel = nil;
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            UIViewController *vc = w.rootViewController;
-            while (vc) {
-                if ([vc isKindOfClass:cls]) { panel = vc; break; }
-                for (UIViewController *c in vc.childViewControllers) {
-                    if ([c isKindOfClass:cls]) { panel = c; break; }
-                }
-                if (panel) break;
-                vc = vc.presentedViewController;
-            }
-            if (panel) break;
-        }
-
-        // 2. 不存在则创建
-        if (!panel) {
-            @try {
-                panel = [[cls alloc] init];
-                NSLog(@"[VCamEnhancer] 创建 VCamSettingsViewController 成功");
-            } @catch (NSException *e) {
-                NSLog(@"[VCamEnhancer] ❌ 创建 VCamSettingsViewController 失败: %@", e);
-                return;
-            }
-        } else {
-            NSLog(@"[VCamEnhancer] 复用已存在的 VCamSettingsViewController");
-        }
-
-        if (![panel isKindOfClass:[UIViewController class]]) {
-            NSLog(@"[VCamEnhancer] ❌ 拿到的不是 UIViewController");
-            return;
-        }
-
-        // 3. 找可 present 的顶层 VC
-        UIWindow *kw = nil;
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.isKeyWindow) { kw = w; break; }
-        }
-        if (!kw) kw = [UIApplication sharedApplication].windows.lastObject;
-        if (!kw) { NSLog(@"[VCamEnhancer] ❌ 无可用 window"); return; }
-
-        UIViewController *top = kw.rootViewController;
-        while (top.presentedViewController) top = top.presentedViewController;
-        if (!top) { NSLog(@"[VCamEnhancer] ❌ 无顶层 VC"); return; }
-        if (top == panel) { NSLog(@"[VCamEnhancer] 面板已在前台"); return; }
-
-        // 4. present
-        @try {
-            panel.modalPresentationStyle = UIModalPresentationFullScreen;
-            [top presentViewController:panel animated:YES completion:^{
-                NSLog(@"[VCamEnhancer] ✅ 面板已弹出");
-            }];
-        } @catch (NSException *e) {
-            NSLog(@"[VCamEnhancer] ❌ present 异常: %@", e);
-        }
-    });
-}
-
-// ============ 接管原版面板 UI ============
+// ============ 接管原版面板 UI（照抄老代码核心）============
 @interface VCamSettingsViewController : UIViewController
 - (void)switchVideoTapped;
 - (void)restoreCameraTapped;
+- (void)toggleFloatingBallTapped;
 - (void)dismissPanel;
 @end
 
@@ -217,18 +167,20 @@ void VCamShowSettingsPanel(void) {
     %orig;
     NSLog(@"[VCamEnhancer] ✅ viewDidLoad 已捕获，接管 UI");
 
+    // 照抄老代码：清空原版 UI
     for (UIView *v in [self.view.subviews copy]) [v removeFromSuperview];
-    self.view.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
 
+    // 挂我们的简化面板，把 self（原版 VC）传给面板，用作按钮 target
     QMEnhancerView *panel = [[QMEnhancerView alloc] initWithFrame:self.view.bounds];
     panel.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     panel.panelVC = self;
     [self.view addSubview:panel];
+    NSLog(@"[VCamEnhancer] ✅ 简化面板已挂载，按钮 target = %@", [self class]);
 }
 
 %end
 
-// ============ LocalVideoPlayer 帧钩子 ============
+// ============ %hook LocalVideoPlayer ============
 @interface LocalVideoPlayer : NSObject
 - (void)updateCurrentBuffer:(CVPixelBufferRef)buffer;
 @end
@@ -242,37 +194,7 @@ void VCamShowSettingsPanel(void) {
 }
 %end
 
-// ============ SpringBoard 挂悬浮球 ============
-%hook SpringBoard
-- (void)applicationDidFinishLaunching:(id)application {
-    %orig;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @try {
-            UIWindow *window = nil;
-            for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                if (w.isKeyWindow) { window = w; break; }
-            }
-            if (!window) {
-                for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                    if ([scene isKindOfClass:[UIWindowScene class]]) {
-                        UIWindowScene *ws = (UIWindowScene *)scene;
-                        for (UIWindow *w in ws.windows) {
-                            if (w.isKeyWindow) { window = w; break; }
-                        }
-                    }
-                    if (window) break;
-                }
-            }
-            if (window) {
-                QMEnhancerView *ball = [QMEnhancerView sharedInstance];
-                [ball showInWindow:window];
-            }
-        } @catch (NSException *e) {}
-    });
-}
-%end
-
+// ============ %ctor ============
 %ctor {
     @autoreleasepool {
         @try {
