@@ -1,5 +1,5 @@
 // ============================================================
-// QianmianEnhancer · 主 Tweak
+// VCamEnhancer · 主 Tweak
 //   ① 帧钩子（旋转 + 缩放）
 //   ② %hook LocalVideoPlayer（调用链保留）
 //   ③ %hook SpringBoard（UI 挂载）
@@ -16,7 +16,7 @@
 #import <objc/runtime.h>
 #import "QMEnhancerView.h"
 
-static NSString *const VPMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings.plist";
+static NSString *const VPMSharedSettingsPath = @"/tmp/vcam_enhancer_settings.plist";
 static NSString *const VPMRotationKey        = @"videoRotationLV";
 static NSString *const VPMScaleKey           = @"videoScaleLV";
 
@@ -111,7 +111,7 @@ static void VPMUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
     @try {
         int64_t seen = __sync_add_and_fetch(&VPMFramesSeen, 1);
         if (seen == 1 && buffer) {
-            NSLog(@"[QianmianEnhancer] 首帧 %zux%zu 格式 %c%c%c%c",
+            NSLog(@"[VCamEnhancer] 首帧 %zux%zu 格式 %c%c%c%c",
                   CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer),
                   (char)((CVPixelBufferGetPixelFormatType(buffer) >> 24) & 0xFF),
                   (char)((CVPixelBufferGetPixelFormatType(buffer) >> 16) & 0xFF),
@@ -159,7 +159,7 @@ static void VPMInstallFrameHook(void) {
 // ① %hook LocalVideoPlayer（调用链保留）
 // ------------------------------------------------------------
 static void mark(NSString *name) {
-    NSString *path = [NSString stringWithFormat:@"/tmp/qm_%@.txt", name];
+    NSString *path = [NSString stringWithFormat:@"/tmp/vcam_%@.txt", name];
     [@"ok" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
