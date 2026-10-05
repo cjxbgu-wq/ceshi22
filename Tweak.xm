@@ -18,7 +18,6 @@
 
 static NSString *const VPMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings.plist";
 static NSString *const VPMRotationKey        = @"videoRotationLV";
-static NSString *const VPMLegacyRotationKey  = @"videoRotation";
 static NSString *const VPMScaleKey           = @"videoScaleLV";
 
 static NSDictionary *VPMReadSettings(void) {
@@ -29,17 +28,11 @@ static NSDictionary *VPMReadSettings(void) {
     return @{};
 }
 
-static void VPMWriteSettings(NSDictionary *settings) {
-    @try { [settings writeToFile:VPMSharedSettingsPath atomically:YES]; }
-    @catch (NSException *e) {}
-}
-
 static NSInteger VPMReadRotation(void) {
     NSInteger r = [[VPMReadSettings() objectForKey:VPMRotationKey] integerValue];
     return (r == 90 || r == 180 || r == 270) ? r : 0;
 }
 
-static const CGFloat VPMScaleSteps[4] = {1.0f, 1.5f, 2.0f, 0.8f};
 static CGFloat VPMReadScale(void) {
     CGFloat s = [[VPMReadSettings() objectForKey:VPMScaleKey] floatValue];
     return (s > 0.05f && s < 20.0f) ? s : 1.0f;
