@@ -1,11 +1,13 @@
 // ============================================================
 // QianmianEnhancer · 主 Tweak
-// 思路完全照抄老代码 VCamExtraKeys.xm：
+// 完全照抄老代码 VCamExtraKeys.xm 的核心机制：
 //   ① hook VCamSettingsViewController 的 init/viewDidLoad
-//      → 保存 VC 到全局 gVCamVC
-//   ② VCamGetSettingsVC() 双路查找：全局 → 视图层级反查
-//   ③ 帧钩子（旋转 + 缩放）
-//   ④ %hook LocalVideoPlayer / SpringBoard
+//      → 保存 VC 实例到全局 gVCamVC
+//   ② VCamGetSettingsVC() 优先用 gVCamVC，再走视图层级反查
+//      （反查逻辑照抄老代码 VPMFindAllPanelEntries）
+//   ③ 帧钩子照抄老代码 VPMUpdateCurrentBufferHook
+//   ④ 旋转/缩放照抄老代码 VPMRotateDirectionInPlace
+//   ⑤ %ctor 照抄老代码（mark + 1 秒延迟装帧钩子）
 // ============================================================
 
 #import <Foundation/Foundation.h>
@@ -41,7 +43,8 @@ static CGFloat VPMReadScale(void) {
 }
 
 // ------------------------------------------------------------
-// 帧处理：方向旋转 + 视频缩放（一字未改）
+// 帧处理：方向旋转 + 视频缩放
+// 照抄老代码 VPMRotateDirectionInPlace，一字未改
 // ------------------------------------------------------------
 static uint8_t *gRotSnap = NULL;
 static size_t   gRotSnapCap = 0;
@@ -106,6 +109,9 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat sc
     } @catch (NSException *e) {}
 }
 
+// ------------------------------------------------------------
+// 帧钩子：照抄老代码 VPMUpdateCurrentBufferHook
+// ------------------------------------------------------------
 static void (*origUpdateCurrentBuffer)(id, SEL, CVBufferRef) = NULL;
 static volatile int64_t VPMFramesSeen = 0;
 
@@ -113,9 +119,14 @@ static void VPMUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
     @try {
         int64_t seen = __sync_add_and_fetch(&VPMFramesSeen, 1);
         if (seen == 1 && buffer) {
-            NSLog(@"[VCamEnhancer] 首帧 %zux%zu",
-                  CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer));
+            NSLog(@"[VCamEnhancer] 首帧 %zux%zu 格式 %c%c%c%c",
+                  CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer),
+                  (char)((CVPixelBufferGetPixelFormatType(buffer) >> 24) & 0xFF),
+                  (char)((CVPixelBufferGetPixelFormatType(buffer) >> 16) & 0xFF),
+                  (char)((CVPixelBufferGetPixelFormatType(buffer) >> 8) & 0xFF),
+                  (char)(CVPixelBufferGetPixelFormatType(buffer) & 0xFF));
         }
+
         static NSInteger cachedRot = -1;
         static CGFloat   cachedScale = -1.0;
         static double    lastRead = 0;
@@ -125,6 +136,7 @@ static void VPMUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
             cachedScale = VPMReadScale();
             lastRead    = now;
         }
+
         if ((cachedRot != 0 || fabs(cachedScale - 1.0f) > 0.01f) && buffer) {
             VPMRotateDirectionInPlace(buffer, cachedRot, cachedScale);
         }
@@ -153,10 +165,7 @@ static void VPMInstallFrameHook(void) {
 }
 
 // ------------------------------------------------------------
-// 全局保存 VCamSettingsViewController（照抄老代码）
-//   双重保障：
-//     ① hook init / viewDidLoad 捕获（用户打开面板时触发）
-//     ② 视图层级反查（照抄老代码 VPMFindAllPanelEntries 思路）
+// 全局 VC 实例（照抄老代码思路）
 // ------------------------------------------------------------
 static __weak UIViewController *gVCamVC = nil;
 
@@ -164,11 +173,11 @@ UIViewController *VCamGetSettingsVC(void) {
     Class cls = NSClassFromString(@"VCamSettingsViewController");
     if (!cls) return nil;
 
-    // 路 1：hook 捕获的实例（用户打开过面板就会命中）
+    // 路 1：hook 保存的实例（用户打开过原版面板就有）
     if (gVCamVC) return gVCamVC;
 
+    // 路 2：照抄老代码 VPMFindAllPanelEntries 的视图层级反查
     @try {
-        // 路 2：照抄老代码的反查逻辑 —— 遍历 window 视图层级，沿 responder 链找 VC
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithArray:[w subviews]];
             int steps = 0;
@@ -176,7 +185,6 @@ UIViewController *VCamGetSettingsVC(void) {
                 steps++;
                 UIView *v = [stack lastObject];
                 [stack removeLastObject];
-
                 UIResponder *r = v;
                 int depth = 0;
                 while (r && depth < 12) {
@@ -187,30 +195,19 @@ UIViewController *VCamGetSettingsVC(void) {
                 for (UIView *c in v.subviews) [stack addObject:c];
             }
         }
-
-        // 路 3：rootVC → presentedVC 链
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            UIViewController *vc = w.rootViewController;
-            int guard = 0;
-            while (vc && guard++ < 16) {
-                if ([vc isKindOfClass:cls]) return vc;
-                vc = vc.presentedViewController;
-            }
-        }
     } @catch (NSException *e) {
         NSLog(@"[VCamEnhancer] VCamGetSettingsVC 异常: %@", e);
     }
     return nil;
 }
 
-// 编译期前向声明
 @interface VCamSettingsViewController : UIViewController
 - (void)switchVideoTapped;
 - (void)restoreCameraTapped;
 - (void)toggleFloatingBallTapped;
 @end
 
-// 照抄老代码：hook init 和 viewDidLoad，捕获 VC 实例
+// 照抄老代码：hook VCamSettingsViewController，捕获实例
 %hook VCamSettingsViewController
 
 - (instancetype)init {
@@ -231,7 +228,7 @@ UIViewController *VCamGetSettingsVC(void) {
 %end
 
 // ------------------------------------------------------------
-// ① %hook LocalVideoPlayer
+// ① %hook LocalVideoPlayer（调用链保留）
 // ------------------------------------------------------------
 static void mark(NSString *name) {
     NSString *path = [NSString stringWithFormat:@"/tmp/vcam_%@.txt", name];
@@ -256,7 +253,7 @@ static void mark(NSString *name) {
 %end
 
 // ------------------------------------------------------------
-// ② %hook SpringBoard
+// ② %hook SpringBoard（UI 挂载）
 // ------------------------------------------------------------
 %hook SpringBoard
 
@@ -269,6 +266,17 @@ static void mark(NSString *name) {
             for (UIWindow *w in [UIApplication sharedApplication].windows) {
                 if (w.isKeyWindow) { window = w; break; }
             }
+            if (!window) {
+                for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                    if ([scene isKindOfClass:[UIWindowScene class]]) {
+                        UIWindowScene *ws = (UIWindowScene *)scene;
+                        for (UIWindow *w in ws.windows) {
+                            if (w.isKeyWindow) { window = w; break; }
+                        }
+                    }
+                    if (window) break;
+                }
+            }
             if (window) {
                 QMEnhancerView *enhancer = [QMEnhancerView sharedInstance];
                 [enhancer showInWindow:window];
@@ -280,7 +288,7 @@ static void mark(NSString *name) {
 %end
 
 // ------------------------------------------------------------
-// ③ %ctor
+// ③ %ctor（照抄老代码：mark + 1 秒延迟装帧钩子）
 // ------------------------------------------------------------
 %ctor {
     @autoreleasepool {
