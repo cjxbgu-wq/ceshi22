@@ -31,7 +31,9 @@ jobs:
           git clone --depth 1 https://github.com/theos/sdks.git $THEOS/sdks
 
       - name: Fix Line Endings
-        run: dos2unix control
+        run: |
+          dos2unix control || true
+          dos2unix Makefile || true
 
       - name: Build Package
         run: |
