@@ -17,9 +17,42 @@ static const CGFloat kQMPad    = 10.0;
 static const CGFloat kQMRowH   = 40.0;
 static const CGFloat kQMGap    = 6.0;
 
-// 图片路径改到 /var/mobile（rootless 下可写）
 static NSString *const kQMFoxBallPath =
     @"/var/mobile/Library/VCamEnhancer/fox_ball.png";
+
+#pragma mark - 按压反馈按钮
+
+@interface VPMPressButton : UIButton
+@end
+
+@implementation VPMPressButton
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesBegan:touches withEvent:event];
+    [UIView animateWithDuration:0.08 delay:0 options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        self.transform = CGAffineTransformMakeScale(0.94, 0.94);
+        self.alpha = 0.8;
+    } completion:nil];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesEnded:touches withEvent:event];
+    [UIView animateWithDuration:0.18 delay:0 usingSpringWithDamping:0.55 initialSpringVelocity:0.8
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        self.transform = CGAffineTransformIdentity;
+        self.alpha = 1.0;
+    } completion:nil];
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesCancelled:touches withEvent:event];
+    self.transform = CGAffineTransformIdentity;
+    self.alpha = 1.0;
+}
+
+@end
 
 #pragma mark - QMEnhancerView
 
@@ -75,6 +108,7 @@ static NSString *const kQMFoxBallPath =
 #pragma mark - 构建 UI
 
 - (void)buildUI {
+    // ============ 悬浮球 ============
     _ball = [[UIView alloc] initWithFrame:self.bounds];
     _ball.backgroundColor = [UIColor clearColor];
     _ball.userInteractionEnabled = YES;
@@ -124,6 +158,7 @@ static NSString *const kQMFoxBallPath =
                                    initWithTarget:self action:@selector(onDrag:)];
     [_ball addGestureRecognizer:pan];
 
+    // ================= 面板 =================
     _panel = [[UIView alloc] initWithFrame:CGRectMake(70, -kQMPanelH / 2, kQMPanelW, kQMPanelH)];
     _panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.95];
     _panel.layer.cornerRadius = 12;
@@ -245,8 +280,8 @@ static NSString *const kQMFoxBallPath =
     [_pageControl addSubview:_closeBtn];
 }
 
-- (UIButton *)makeRow:(NSString *)title color:(UIColor *)color frame:(CGRect)frame selector:(SEL)sel {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+- (VPMPressButton *)makeRow:(NSString *)title color:(UIColor *)color frame:(CGRect)frame selector:(SEL)sel {
+    VPMPressButton *b = [VPMPressButton buttonWithType:UIButtonTypeCustom];
     b.frame = frame;
     b.backgroundColor = [color colorWithAlphaComponent:0.22];
     b.layer.cornerRadius = 8;
@@ -269,48 +304,32 @@ static NSString *const kQMFoxBallPath =
     if (_panelOpen) [self refreshAll];
 }
 
-#pragma mark - 调用原 VCam 面板 VC
-
-- (UIViewController *)findPanelVC {
-    Class cls = NSClassFromString(@"VCamSettingsViewController");
-    if (!cls) return nil;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        UIViewController *root = w.rootViewController;
-        if (!root) continue;
-        UIViewController *vc = root;
-        while (vc) {
-            if ([vc isKindOfClass:cls]) return vc;
-            if (vc.presentedViewController) vc = vc.presentedViewController;
-            else break;
-        }
-        UIViewController *f = [self findInChildren:root class:cls];
-        if (f) return f;
-    }
-    return nil;
-}
-
-- (UIViewController *)findInChildren:(UIViewController *)parent class:(Class)cls {
-    for (UIViewController *c in parent.childViewControllers) {
-        if ([c isKindOfClass:cls]) return c;
-        UIViewController *r = [self findInChildren:c class:cls];
-        if (r) return r;
-    }
-    return nil;
-}
+#pragma mark - 转发到原版面板（视图层级反查，跟老代码一致）
 
 - (void)callPanelSelector:(SEL)sel title:(NSString *)title {
-    UIViewController *vc = [self findPanelVC];
-    if (!vc || ![vc respondsToSelector:sel]) {
-        NSLog(@"[VCamEnhancer] 面板 VC 未找到或无方法: %@", title);
-        return;
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = VCamGetSettingsVC();
+        if (!vc) {
+            NSLog(@"[VCamEnhancer] %@：未找到原版面板 VC（需先打开过原版面板）", title);
+            return;
+        }
+        if (![vc respondsToSelector:sel]) {
+            NSLog(@"[VCamEnhancer] %@：VC 无该方法", title);
+            return;
+        }
+        @try {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    [vc performSelector:sel];
+            [vc performSelector:sel];
 #pragma clang diagnostic pop
+            NSLog(@"[VCamEnhancer] %@：已转发到原版面板", title);
+        } @catch (NSException *e) {
+            NSLog(@"[VCamEnhancer] %@：异常 %@", title, e);
+        }
+    });
 }
 
-#pragma mark - 控制页动作
+#pragma mark - 控制页动作（纯转发）
 
 - (void)onPickVideo        { [self callPanelSelector:@selector(switchVideoTapped)        title:@"选择内容"]; }
 - (void)onBanVideo         { [self callPanelSelector:@selector(restoreCameraTapped)      title:@"暂停显示"]; }
