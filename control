@@ -1,0 +1,9 @@
+Package: com.qianmian.enhancer
+Name: 千面-VCAM 增强
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 千面-VCAM 增强：视频方向旋转 + 视频缩放
+Maintainer: Qianmian
+Author: Qianmian
+Section: Tweaks
+Depends: mobilesubstrate, com.taokk3.qianmian, rootless-compat (>= 0.9)
