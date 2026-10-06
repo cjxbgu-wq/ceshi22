@@ -42,9 +42,9 @@ static void VLOGInit(void) {
     pthread_mutex_unlock(&gVLOGLock); \
 } while(0)
 
-// ============ 路径常量 ============
-static NSString *const VPMSharedSettingsPath = @"/var/mobile/Media/DCIM/vc.plist";
-static NSString *const VPMMediaDir           = @"/var/mobile/Media/DCIM";
+// ============ 路径常量（★ 改为 mediaserverd 容器）============
+static NSString *const VPMSharedSettingsPath = @"/var/mobile/Library/Caches/com.apple.mediaserverd/vc.plist";
+static NSString *const VPMMediaDir           = @"/var/mobile/Library/Caches/com.apple.mediaserverd";
 static NSString *const VPMRotationKey        = @"videoRotationLV";
 static NSString *const VPMScaleKey           = @"videoScaleLV";
 static NSString *const VPMEnabledKey         = @"enabled";
@@ -58,6 +58,9 @@ static void VPMEnsureDir(void) {
       withIntermediateDirectories:YES attributes:nil error:&err];
         if (err) VLOG(@"建目录失败: %@", err);
     }
+    // ★ 权限 0777，mediaserverd 沙盒可读写
+    [fm setAttributes:@{NSFilePosixPermissions: @0777}
+         ofItemAtPath:VPMMediaDir error:nil];
 }
 
 static NSDictionary *VPMReadSettings(void) {
@@ -101,7 +104,6 @@ static CGFloat VPMReadScale(void) {
 - (void)stop;
 - (CVBufferRef)currentFrame;
 
-// 内部方法
 - (void)setupVideoReader:(NSString *)path;
 - (BOOL)decodeOneFrame;
 @end
@@ -130,7 +132,7 @@ static CGFloat VPMReadScale(void) {
     if (_currentPixelBuffer) { CVPixelBufferRelease(_currentPixelBuffer); _currentPixelBuffer = NULL; }
 }
 
-#pragma mark - 加载入口（桥接调用）
+#pragma mark - 加载入口
 
 - (void)loadMediaAtPath:(NSString *)path completion:(void (^)(BOOL))completion {
     if (!path.length) { if (completion) completion(NO); return; }
@@ -292,7 +294,7 @@ static CGFloat VPMReadScale(void) {
     return YES;
 }
 
-#pragma mark - 帧接收（帧钩子挂载点）
+#pragma mark - 帧接收
 
 - (void)updateCurrentBuffer:(CVBufferRef)buffer {
     if (!buffer) return;
@@ -305,8 +307,7 @@ static CGFloat VPMReadScale(void) {
     [_lock unlock];
 }
 
-// ★★★ 修复：currentFrame 必须 retain，否则调用方使用期间帧被解码线程替换，
-//     产生野指针 → transfer 失败或画面一闪一闪
+// ★ retain，防解码线程并发替换导致野指针
 - (CVBufferRef)currentFrame {
     [_lock lock];
     CVBufferRef f = _currentPixelBuffer;
@@ -333,7 +334,7 @@ static void QMPipelineEmitHook(id self, SEL _cmd, CMSampleBufferRef sb) {
         if (sb) {
             CVImageBufferRef cameraBuf = CMSampleBufferGetImageBuffer(sb);
             LocalVideoPlayer *p = [LocalVideoPlayer shared];
-            CVBufferRef replaceBuf = p ? [p currentFrame] : NULL;  // ★ retain 过的帧
+            CVBufferRef replaceBuf = p ? [p currentFrame] : NULL;
 
             if (cameraBuf && replaceBuf) {
                 if (!gQMPipelineTransfer) {
@@ -353,7 +354,6 @@ static void QMPipelineEmitHook(id self, SEL _cmd, CMSampleBufferRef sb) {
                         VLOG(@"✅ 相机管线首帧替换 (%zux%zu)",
                              CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf));
                     }
-                    // 每 30 帧报一次统计（用于定位一闪一闪）
                     if (total - gQMLastReport >= 30) {
                         gQMLastReport = total;
                         VLOG(@"📊 管线统计: 成功 %lld / 失败 %lld / 空帧 %lld (cam %zux%zu 0x%X, rep %zux%zu 0x%X)",
@@ -369,7 +369,6 @@ static void QMPipelineEmitHook(id self, SEL _cmd, CMSampleBufferRef sb) {
                         VLOG(@"⚠️ transfer 失败 %d (src 0x%X dst 0x%X)", (int)s, sf, df);
                     }
                 }
-                // ★★★ 修复：currentFrame 里 retain 过，用完必须 release
                 CVPixelBufferRelease(replaceBuf);
             } else {
                 gQMNullCount++;
@@ -690,7 +689,6 @@ static void VPMScheduleBootstrap(int attempt) {
 // ============================================================
 %ctor {
     @autoreleasepool {
-        // ★ 强制 linker 保留 LocalVideoPlayer 类
         [LocalVideoPlayer class];
 
         VLOGInit();
