@@ -161,29 +161,15 @@ static void VPMUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
     }
 }
 
-// ★ 第五轮：类直接拥有该方法校验
-static BOOL VPMClassOwnsMethod(Class cls, SEL sel) {
-    if (!cls || !sel) return NO;
-    unsigned int count = 0;
-    Method *list = class_copyMethodList(cls, &count);
-    BOOL owns = NO;
-    for (unsigned int i = 0; i < count; i++) {
-        if (sel_isEqual(method_getName(list[i]), sel)) { owns = YES; break; }
-    }
-    if (list) free(list);
-    return owns;
-}
-
+// ★ 修复：删除 VPMClassOwnsMethod 检查（原实现用 class_copyMethodList 只看类
+// 自身实现，会挡掉继承自父类的 updateCurrentBuffer:，导致钩子永远装不上）。
+// 现与 Theos %hook 语义一致：class_getInstanceMethod 沿继承链查找 + 直接替换。
 static BOOL VPMFrameInstalled = NO;
 static void VPMInstallFrameHook(void) {
     if (VPMFrameInstalled) return;
     @try {
         Class lvp = NSClassFromString(@"LocalVideoPlayer");
         if (!lvp) { VLOG(@"⚠️ LocalVideoPlayer 类不存在，等下次"); return; }
-        if (!VPMClassOwnsMethod(lvp, @selector(updateCurrentBuffer:))) {
-            VLOG(@"⚠️ LocalVideoPlayer 未直接实现 updateCurrentBuffer:，跳过");
-            return;
-        }
         Method m = class_getInstanceMethod(lvp, @selector(updateCurrentBuffer:));
         if (!m) { VLOG(@"⚠️ updateCurrentBuffer: 方法不存在"); return; }
         IMP orig = method_getImplementation(m);
