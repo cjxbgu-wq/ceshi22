@@ -33,7 +33,6 @@ static void QMEnsureDir(void) {
       withIntermediateDirectories:YES attributes:nil error:&err];
         if (err) NSLog(@"[QMEnhancer] 建目录失败: %@", err);
     }
-    // ★ 0777：mediaserverd 沙盒可读写
     [fm setAttributes:@{NSFilePosixPermissions: @0777}
          ofItemAtPath:kQMMediaDir error:nil];
 }
@@ -56,7 +55,6 @@ static void QMWriteSettingsLocked(NSDictionary *d) {
         NSLog(@"[QMEnhancer] 写 plist 失败");
         return;
     }
-    // ★ 0666：mediaserverd 可读
     [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0666}
                                      ofItemAtPath:kQMSharedSettingsPath error:nil];
     notify_post(kQMNotifyName);
@@ -89,15 +87,35 @@ static BOOL QMReadEnabled(void) {
     return s[kQMEnabledKey] ? [s[kQMEnabledKey] boolValue] : YES;
 }
 
-// ★ 槽位路径带 .mov 扩展名（mediaserverd 按扩展名判类型）
+// ★ 槽位路径：按多扩展名搜索（mov/mp4/png/jpg/jpeg/heic）
 static NSString *QMSlotPath(NSInteger slot) {
-    return [kQMMediaDir stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"vcam_slot_%ld.mov", (long)slot]];
+    NSString *base = [kQMMediaDir stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"vcam_slot_%ld", (long)slot]];
+    NSArray *exts = @[@"mov", @"mp4", @"png", @"jpg", @"jpeg", @"heic"];
+    for (NSString *e in exts) {
+        NSString *p = [base stringByAppendingPathExtension:e];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return p;
+    }
+    // 没有已存在的文件，返回默认 mov 路径
+    return [base stringByAppendingPathExtension:@"mov"];
 }
+
 // 兼容旧的无扩展名文件
 static NSString *QMSlotPathLegacy(NSInteger slot) {
     return [kQMMediaDir stringByAppendingPathComponent:
             [NSString stringWithFormat:@"vcam_slot_%ld", (long)slot]];
+}
+
+// 返回槽位文件对应的扩展名（如果存在），否则 nil
+static NSString *QMSlotExistingExt(NSInteger slot) {
+    NSString *base = [kQMMediaDir stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"vcam_slot_%ld", (long)slot]];
+    NSArray *exts = @[@"mov", @"mp4", @"png", @"jpg", @"jpeg", @"heic"];
+    for (NSString *e in exts) {
+        NSString *p = [base stringByAppendingPathExtension:e];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return e;
+    }
+    return nil;
 }
 
 static BOOL QMPathLooksLikeImage(NSString *path) {
@@ -353,8 +371,11 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
 - (NSInteger)nextEmptySlot {
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSInteger i = 1; i <= kQMSlotCount; i++) {
-        if (![fm fileExistsAtPath:QMSlotPath(i)] &&
-            ![fm fileExistsAtPath:QMSlotPathLegacy(i)]) return i;
+        // 检查所有可能扩展名 + 旧无扩展名
+        BOOL exists = NO;
+        if (QMSlotExistingExt(i)) exists = YES;
+        if ([fm fileExistsAtPath:QMSlotPathLegacy(i)]) exists = YES;
+        if (!exists) return i;
     }
     return 0;
 }
@@ -366,7 +387,7 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
     NSInteger filled = 0;
     for (UIButton *b in _slotButtons) {
         NSInteger slot = b.tag;
-        BOOL exists = [fm fileExistsAtPath:QMSlotPath(slot)] ||
+        BOOL exists = (QMSlotExistingExt(slot) != nil) ||
                       [fm fileExistsAtPath:QMSlotPathLegacy(slot)];
         if (exists) filled++;
         if (exists) {
@@ -395,7 +416,7 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
     [self updateStatusLabel];
 }
 
-#pragma mark - 槽位交互（★ 参考 VcamLiteSlotPatch：添加不激活，点击才激活）
+#pragma mark - 槽位交互（添加不激活，点击才激活）
 
 // ★ 空槽位：打开 picker 添加（不激活）
 // ★ 有内容槽位：激活（按 1 播 1，按 2 播 2，按 3 播 3）
@@ -403,9 +424,9 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
     if (_isPresentingPicker) return;
     NSInteger slot = sender.tag;
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *path = QMSlotPath(slot);
+    NSString *ext = QMSlotExistingExt(slot);
     NSString *legacy = QMSlotPathLegacy(slot);
-    BOOL exists = [fm fileExistsAtPath:path] || [fm fileExistsAtPath:legacy];
+    BOOL exists = (ext != nil) || [fm fileExistsAtPath:legacy];
     if (!exists) {
         // 空槽位 → 添加，不激活
         _selectingSlot = slot;
@@ -413,7 +434,7 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
         return;
     }
     // 有内容 → 激活
-    NSString *realPath = [fm fileExistsAtPath:path] ? path : legacy;
+    NSString *realPath = (ext != nil) ? QMSlotPath(slot) : legacy;
     QMUpdateSettings(^(NSMutableDictionary *s) {
         s[kQMActiveSlotKey] = @(slot);
         s[kQMMediaPathKey]  = realPath;
@@ -436,11 +457,21 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
     if (_isPresentingPicker) return;
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSInteger i = 1; i <= kQMSlotCount; i++) {
-        [fm removeItemAtPath:QMSlotPath(i) error:nil];
+        // 清所有扩展名
+        NSString *base = [kQMMediaDir stringByAppendingPathComponent:
+                          [NSString stringWithFormat:@"vcam_slot_%ld", (long)i]];
+        NSArray *exts = @[@"mov", @"mp4", @"png", @"jpg", @"jpeg", @"heic"];
+        for (NSString *e in exts) {
+            [fm removeItemAtPath:[base stringByAppendingPathExtension:e] error:nil];
+        }
         [fm removeItemAtPath:QMSlotPathLegacy(i) error:nil];
     }
-    // 同时清空临时文件
-    [fm removeItemAtPath:[kQMMediaDir stringByAppendingPathComponent:@"vcam_temp.mov"] error:nil];
+    // 清临时文件
+    for (NSString *e in @[@"mov", @"mp4", @"png", @"jpg", @"jpeg", @"heic"]) {
+        [fm removeItemAtPath:
+            [[kQMMediaDir stringByAppendingPathComponent:@"vcam_temp"]
+                stringByAppendingPathExtension:e] error:nil];
+    }
 
     QMUpdateSettings(^(NSMutableDictionary *s) {
         s[kQMActiveSlotKey] = @0;
@@ -503,6 +534,7 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
 }
 
 // ★ 核心：pendingSlot == 0 → 临时替换；>=1 → 添加槽位（不激活）
+//    ★ 按类型写扩展名：视频 → .mov，图片 → .png
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     _isPresentingPicker = NO;
     NSInteger pendingSlot = _selectingSlot;
@@ -514,36 +546,45 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
         if (!ss) return;
         if (results.count == 0) return;
 
-        // 确定目标和语义
+        PHPickerResult *res = results.firstObject;
+        NSItemProvider *prov = res.itemProvider;
+
+        // 判断类型
+        NSString *type = nil;
+        if ([prov hasItemConformingToTypeIdentifier:kQMUTIMovie]) type = kQMUTIMovie;
+        else if ([prov hasItemConformingToTypeIdentifier:kQMUTIImage]) type = kQMUTIImage;
+        if (!type) { [ss toast:@"无法识别媒体类型"]; return; }
+
+        // ★ 按类型选扩展名
+        BOOL isVideo = [type isEqualToString:kQMUTIMovie];
+        NSString *ext = isVideo ? @"mov" : @"png";
+
+        // 确定目标路径
         NSInteger slot = pendingSlot;
         NSString *dst = nil;
         BOOL isTemp = NO;
 
         if (slot == 0) {
             // 设置 tab 的"选择图片/视频" → 临时替换
-            dst = [kQMMediaDir stringByAppendingPathComponent:@"vcam_temp.mov"];
+            dst = [kQMMediaDir stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"vcam_temp.%@", ext]];
             isTemp = YES;
         } else if (slot >= 1 && slot <= kQMSlotCount) {
             // 添加槽位 → 只写文件不激活
-            dst = QMSlotPath(slot);
+            dst = [kQMMediaDir stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"vcam_slot_%ld.%@", (long)slot, ext]];
         } else {
             // 兜底：找空槽
             slot = [ss nextEmptySlot];
             if (slot == 0) slot = 1;
-            dst = QMSlotPath(slot);
+            dst = [kQMMediaDir stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"vcam_slot_%ld.%@", (long)slot, ext]];
         }
-
-        PHPickerResult *res = results.firstObject;
-        NSItemProvider *prov = res.itemProvider;
-
-        NSString *type = nil;
-        if ([prov hasItemConformingToTypeIdentifier:kQMUTIMovie]) type = kQMUTIMovie;
-        else if ([prov hasItemConformingToTypeIdentifier:kQMUTIImage]) type = kQMUTIImage;
-        if (!type) { [ss toast:@"无法识别媒体类型"]; return; }
 
         NSInteger capturedSlot = slot;
         BOOL capturedTemp = isTemp;
         NSString *capturedDst = dst;
+        NSString *capturedExt = ext;
 
         [prov loadFileRepresentationForTypeIdentifier:type
                                     completionHandler:^(NSURL *url, NSError *err) {
@@ -554,8 +595,8 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
 
             QMEnsureDir();
             NSString *safeTmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                                 [NSString stringWithFormat:@"qmpick_%ld_%u.tmp",
-                                  (long)capturedSlot, arc4random()]];
+                                 [NSString stringWithFormat:@"qmpick_%ld_%u.%@",
+                                  (long)capturedSlot, arc4random(), capturedExt]];
             NSError *cpErr = nil;
             BOOL okSync = [[NSFileManager defaultManager] copyItemAtPath:url.path
                                                                   toPath:safeTmp
@@ -570,11 +611,23 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
 
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                 NSFileManager *fm = [NSFileManager defaultManager];
-                // 清理旧文件
+
+                // 清理同槽位的旧文件（所有扩展名）
                 if (!capturedTemp) {
+                    NSString *base = [kQMMediaDir stringByAppendingPathComponent:
+                                      [NSString stringWithFormat:@"vcam_slot_%ld", (long)capturedSlot]];
+                    NSArray *exts = @[@"mov", @"mp4", @"png", @"jpg", @"jpeg", @"heic"];
+                    for (NSString *e in exts) {
+                        [fm removeItemAtPath:[base stringByAppendingPathExtension:e] error:nil];
+                    }
                     [fm removeItemAtPath:QMSlotPathLegacy(capturedSlot) error:nil];
+                } else {
+                    // 临时替换：清旧的 temp 所有扩展名
+                    NSString *base = [kQMMediaDir stringByAppendingPathComponent:@"vcam_temp"];
+                    for (NSString *e in @[@"mov", @"mp4", @"png", @"jpg", @"jpeg", @"heic"]) {
+                        [fm removeItemAtPath:[base stringByAppendingPathExtension:e] error:nil];
+                    }
                 }
-                [fm removeItemAtPath:capturedDst error:nil];
 
                 NSError *mvErr = nil;
                 if (![fm moveItemAtPath:safeTmp toPath:capturedDst error:&mvErr]) {
@@ -585,14 +638,15 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
                     });
                     return;
                 }
-                // ★ 0666 权限
+                // 0666 权限
                 [fm setAttributes:@{NSFilePosixPermissions: @0666} ofItemAtPath:capturedDst error:nil];
 
                 if (capturedTemp) {
-                    // 临时替换：切换 mediaPath（让桥接加载）
+                    // 临时替换：切换 mediaPath
                     QMUpdateSettings(^(NSMutableDictionary *s) {
                         s[kQMMediaPathKey] = capturedDst;
                         s[kQMEnabledKey]   = @YES;
+                        s[kQMActiveSlotKey] = @0;   // 清掉槽位标记
                     });
                     NSLog(@"[QMEnhancer] 临时替换: %@", capturedDst);
                 } else {
