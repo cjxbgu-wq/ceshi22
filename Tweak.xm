@@ -602,4 +602,236 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat us
                 // 应用变换：平移到中心 + 旋转 + 按比例绘制
                 CGContextTranslateCTM(ctx, 0, H);
                 CGContextScaleCTM(ctx, 1, -1);              // Y 翻转
-                CGContextTranslateCTM(ctx, W / 2.0, H / 
+                CGContextTranslateCTM(ctx, W / 2.0, H / 2.0);
+                if (rot) CGContextRotateCTM(ctx, -(CGFloat)rad);
+                CGContextDrawImage(ctx, CGRectMake(-dw / 2.0, -dh / 2.0, dw, dh), img);
+                CGContextFlush(ctx);
+            }
+            if (ctx) CFRelease(ctx);
+            if (img) CFRelease(img);
+            if (prov) CFRelease(prov);
+            CFRelease(cs);
+        }
+        CVPixelBufferUnlockBaseAddress(buf, 0);
+    } @catch (NSException *e) {}
+}
+
+// ============================================================
+//  帧钩子（旋转/缩放）
+// ============================================================
+static void (*origUpdateCurrentBuffer)(id, SEL, CVBufferRef) = NULL;
+static volatile int64_t VPMFramesSeen = 0;
+
+static void VPMUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
+    @try {
+        int64_t seen = __sync_add_and_fetch(&VPMFramesSeen, 1);
+        if (seen == 1 && buffer) {
+            VLOG(@"帧钩子首帧 %zux%zu fmt 0x%X",
+                 CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer),
+                 CVPixelBufferGetPixelFormatType(buffer));
+        }
+        static NSInteger cachedRot = -1;
+        static CGFloat   cachedScale = -1.0;
+        static double    lastRead = 0;
+        double now = [NSDate timeIntervalSinceReferenceDate];
+        if (cachedRot < 0 || cachedScale < 0 || (now - lastRead) > 0.5) {
+            cachedRot   = VPMReadRotation();
+            cachedScale = VPMReadScale();
+            lastRead    = now;
+        }
+        if ((cachedRot != 0 || fabs(cachedScale - 1.0f) > 0.01f) && buffer) {
+            VPMRotateDirectionInPlace(buffer, cachedRot, cachedScale);
+        }
+        if (origUpdateCurrentBuffer) origUpdateCurrentBuffer(self, _cmd, buffer);
+    } @catch (NSException *e) {
+        if (origUpdateCurrentBuffer) origUpdateCurrentBuffer(self, _cmd, buffer);
+    }
+}
+
+static BOOL VPMClassOwnsMethod(Class cls, SEL sel) {
+    if (!cls || !sel) return NO;
+    unsigned int count = 0;
+    Method *list = class_copyMethodList(cls, &count);
+    BOOL owns = NO;
+    for (unsigned int i = 0; i < count; i++) {
+        if (sel_isEqual(method_getName(list[i]), sel)) { owns = YES; break; }
+    }
+    if (list) free(list);
+    return owns;
+}
+
+static BOOL VPMFrameInstalled = NO;
+static void VPMInstallFrameHook(void) {
+    if (VPMFrameInstalled) return;
+    @try {
+        Class lvp = NSClassFromString(@"LocalVideoPlayer");
+        if (!lvp) return;
+        if (!VPMClassOwnsMethod(lvp, @selector(updateCurrentBuffer:))) return;
+        Method m = class_getInstanceMethod(lvp, @selector(updateCurrentBuffer:));
+        if (!m) return;
+        IMP orig = method_getImplementation(m);
+        if (orig == (IMP)VPMUpdateCurrentBufferHook) { VPMFrameInstalled = YES; return; }
+        origUpdateCurrentBuffer = (void (*)(id, SEL, CVBufferRef))orig;
+        method_setImplementation(m, (IMP)VPMUpdateCurrentBufferHook);
+        VPMFrameInstalled = YES;
+        VLOG(@"✅ 帧钩子已安装");
+    } @catch (NSException *e) { VLOG(@"❌ 帧钩子安装异常: %@", e); }
+}
+
+// ============================================================
+//  桥接
+// ============================================================
+typedef void (^VLCompletion)(BOOL);
+static VLCompletion gNoopCompletion = NULL;
+static dispatch_source_t gBridgeTimer = NULL;
+static NSString *gLastBridgedPath = nil;
+static BOOL gLastEnabled = YES;
+static BOOL gHasLastEnabled = NO;
+
+static void VPMEnsureNoopBlock(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gNoopCompletion = [^(BOOL ok){ (void)ok; } copy]; });
+}
+
+static void VPMPlayerDisable(void) {
+    @try {
+        Class cls = NSClassFromString(@"LocalVideoPlayer");
+        if (!cls || ![cls respondsToSelector:@selector(shared)]) return;
+        id player = ((id(*)(id,SEL))objc_msgSend)(cls, @selector(shared));
+        if (!player) return;
+        if ([player respondsToSelector:@selector(clearCurrentBuffer)]) {
+            ((void(*)(id,SEL))objc_msgSend)(player, @selector(clearCurrentBuffer));
+        }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @try {
+                if ([player respondsToSelector:@selector(stop)]) {
+                    ((void(*)(id,SEL))objc_msgSend)(player, @selector(stop));
+                }
+            } @catch (NSException *e) {}
+        });
+        VLOG(@"🔇 已禁用");
+    } @catch (NSException *e) { VLOG(@"禁用异常: %@", e); }
+}
+
+static void VPMBridgeTryLoad(NSString *path) {
+    if (!path.length) return;
+    Class cls = NSClassFromString(@"LocalVideoPlayer");
+    if (!cls) return;
+
+    id player = nil;
+    if ([cls respondsToSelector:@selector(shared)]) {
+        player = ((id(*)(id,SEL))objc_msgSend)(cls, @selector(shared));
+    }
+    if (!player) return;
+
+    VPMEnsureNoopBlock();
+
+    NSArray<NSString *> *candidates = @[
+        @"loadMediaAtPath:completion:",
+        @"loadVideoAtPath:completion:",
+        @"loadImageAtPath:completion:"
+    ];
+
+    for (NSString *name in candidates) {
+        SEL sel = NSSelectorFromString(name);
+        if (![player respondsToSelector:sel]) continue;
+        @try {
+            ((void(*)(id, SEL, NSString*, VLCompletion))objc_msgSend)(player, sel, path, gNoopCompletion);
+            VLOG(@"📤 桥接已调用 %@ -> %@", name, path);
+            if ([player respondsToSelector:@selector(play)]) {
+                ((void(*)(id,SEL))objc_msgSend)(player, @selector(play));
+            }
+            return;
+        } @catch (NSException *e) { VLOG(@"❌ 桥接 %@ 异常: %@", name, e); }
+    }
+}
+
+static void VPMStartBridgePolling(void) {
+    if (gBridgeTimer) return;
+    VPMEnsureDir();
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    gBridgeTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(gBridgeTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                              1 * NSEC_PER_SEC,
+                              (uint64_t)(0.2 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(gBridgeTimer, ^{
+        @autoreleasepool {
+            NSDictionary *s = VPMReadSettings();
+            BOOL enabled = VPMReadEnabled();
+
+            if (!gHasLastEnabled) {
+                gHasLastEnabled = YES;
+                gLastEnabled = enabled;
+            } else if (enabled != gLastEnabled) {
+                gLastEnabled = enabled;
+                if (!enabled) {
+                    VPMPlayerDisable();
+                } else {
+                    gLastBridgedPath = nil;
+                }
+                VLOG(@"状态切换: enabled=%d", enabled);
+            }
+            if (!enabled) return;
+
+            NSString *path = s[VPMMediaPathKey];
+            if (!path.length) return;
+            if ([path isEqualToString:gLastBridgedPath ?: @""]) return;
+            gLastBridgedPath = [path copy];
+            VPMBridgeTryLoad(path);
+        }
+    });
+    dispatch_resume(gBridgeTimer);
+    VLOG(@"✅ 桥接轮询已启动");
+}
+
+// ============================================================
+//  引导
+// ============================================================
+static void VPMScheduleBootstrap(int attempt) {
+    if (VPMFrameInstalled) return;
+    if (attempt > 60) { VLOG(@"⚠️ 引导超时"); return; }
+    Class lvClass = NSClassFromString(@"LocalVideoPlayer");
+    if (lvClass) {
+        VLOG(@"✅ 引导成功（第 %d 次）", attempt);
+        VPMInstallFrameHook();
+        VPMStartBridgePolling();
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        VPMScheduleBootstrap(attempt + 1);
+    });
+}
+
+// ============================================================
+//  SpringBoard
+// ============================================================
+%hook SpringBoard
+- (void)applicationDidFinishLaunching:(id)application {
+    %orig;
+    VLOG(@"SpringBoard 启动完成");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [[QMFloatBall shared] show];
+    });
+}
+%end
+
+// ============================================================
+//  ★ %ctor：只在 mediaserverd 跑引擎
+// ============================================================
+%ctor {
+    @autoreleasepool {
+        [LocalVideoPlayer class];
+        VLOGInit();
+        NSString *proc = [[NSProcessInfo processInfo] processName];
+        VLOG(@"VCamEnhancer 已加载，进程=%@", proc);
+        VPMEnsureDir();
+
+        if ([proc isEqualToString:@"mediaserverd"]) {
+            QMInstallHooks();
+            VPMScheduleBootstrap(0);
+        }
+    }
+}
