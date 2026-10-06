@@ -1,5 +1,5 @@
 ARCHS = arm64 arm64e
-TARGET = iphone:clang:latest:15.0
+TARGET = iphone:clang:latest:16.0
 INSTALL_TARGET_PROCESSES = SpringBoard mediaserverd
 
 include $(THEOS)/makefiles/common.mk
@@ -10,7 +10,7 @@ QianmianEnhancer_FILES = Tweak.xm \
     QMEnhancerView.m
 
 QianmianEnhancer_CFLAGS = -fobjc-arc
-QianmianEnhancer_FRAMEWORKS = UIKit Foundation CoreVideo CoreMedia VideoToolbox CoreImage AVFoundation QuartzCore PhotosUI
+QianmianEnhancer_FRAMEWORKS = UIKit Foundation CoreVideo CoreMedia VideoToolbox CoreImage AVFoundation QuartzCore PhotosUI ImageIO
 QianmianEnhancer_PRIVATE_FRAMEWORKS =
 QianmianEnhancer_LIBRARIES = substrate
 
