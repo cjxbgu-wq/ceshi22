@@ -7,7 +7,7 @@
 #import <stdlib.h>
 
 // ============================================================
-//  路径（★ 改为 mediaserverd 容器）
+//  路径（mediaserverd 容器，沙盒可读写）
 // ============================================================
 static NSString *const kQMSharedSettingsPath = @"/var/mobile/Library/Caches/com.apple.mediaserverd/vc.plist";
 static NSString *const kQMMediaDir            = @"/var/mobile/Library/Caches/com.apple.mediaserverd";
@@ -33,12 +33,13 @@ static void QMEnsureDir(void) {
       withIntermediateDirectories:YES attributes:nil error:&err];
         if (err) NSLog(@"[QMEnhancer] 建目录失败: %@", err);
     }
+    // ★ 0777：mediaserverd 沙盒可读写
     [fm setAttributes:@{NSFilePosixPermissions: @0777}
          ofItemAtPath:kQMMediaDir error:nil];
 }
 
 // ============================================================
-//  设置读写
+//  设置读写（含原子读改写）
 // ============================================================
 static NSDictionary *QMReadSettings(void) {
     @try {
@@ -55,6 +56,7 @@ static void QMWriteSettingsLocked(NSDictionary *d) {
         NSLog(@"[QMEnhancer] 写 plist 失败");
         return;
     }
+    // ★ 0666：mediaserverd 可读
     [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0666}
                                      ofItemAtPath:kQMSharedSettingsPath error:nil];
     notify_post(kQMNotifyName);
@@ -86,10 +88,13 @@ static BOOL QMReadEnabled(void) {
     NSDictionary *s = QMReadSettings();
     return s[kQMEnabledKey] ? [s[kQMEnabledKey] boolValue] : YES;
 }
+
+// ★ 槽位路径带 .mov 扩展名（mediaserverd 按扩展名判类型）
 static NSString *QMSlotPath(NSInteger slot) {
     return [kQMMediaDir stringByAppendingPathComponent:
             [NSString stringWithFormat:@"vcam_slot_%ld.mov", (long)slot]];
 }
+// 兼容旧的无扩展名文件
 static NSString *QMSlotPathLegacy(NSInteger slot) {
     return [kQMMediaDir stringByAppendingPathComponent:
             [NSString stringWithFormat:@"vcam_slot_%ld", (long)slot]];
@@ -390,8 +395,10 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
     [self updateStatusLabel];
 }
 
-#pragma mark - 槽位交互
+#pragma mark - 槽位交互（★ 参考 VcamLiteSlotPatch：添加不激活，点击才激活）
 
+// ★ 空槽位：打开 picker 添加（不激活）
+// ★ 有内容槽位：激活（按 1 播 1，按 2 播 2，按 3 播 3）
 - (void)onSlotTapped:(UIButton *)sender {
     if (_isPresentingPicker) return;
     NSInteger slot = sender.tag;
@@ -400,10 +407,12 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
     NSString *legacy = QMSlotPathLegacy(slot);
     BOOL exists = [fm fileExistsAtPath:path] || [fm fileExistsAtPath:legacy];
     if (!exists) {
+        // 空槽位 → 添加，不激活
         _selectingSlot = slot;
         [self presentPicker];
         return;
     }
+    // 有内容 → 激活
     NSString *realPath = [fm fileExistsAtPath:path] ? path : legacy;
     QMUpdateSettings(^(NSMutableDictionary *s) {
         s[kQMActiveSlotKey] = @(slot);
@@ -411,9 +420,10 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
         s[kQMEnabledKey]    = @YES;
     });
     [self updateSlotButtons];
-    NSLog(@"[QMEnhancer] 切换槽位 %ld -> %@", (long)slot, realPath);
+    NSLog(@"[QMEnhancer] 激活槽位 %ld -> %@", (long)slot, realPath);
 }
 
+// 添加媒体到空槽位（找第一个空槽 → 打开 picker）
 - (void)onAddToSlot {
     if (_isPresentingPicker) return;
     NSInteger next = [self nextEmptySlot];
@@ -429,6 +439,9 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
         [fm removeItemAtPath:QMSlotPath(i) error:nil];
         [fm removeItemAtPath:QMSlotPathLegacy(i) error:nil];
     }
+    // 同时清空临时文件
+    [fm removeItemAtPath:[kQMMediaDir stringByAppendingPathComponent:@"vcam_temp.mov"] error:nil];
+
     QMUpdateSettings(^(NSMutableDictionary *s) {
         s[kQMActiveSlotKey] = @0;
         s[kQMEnabledKey]    = @NO;
@@ -438,9 +451,10 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
     [self toast:@"已清空所有槽位"];
 }
 
+// ★ 设置 tab 的"选择图片/视频"：临时替换，不占槽位
 - (void)onPickMedia {
     if (_isPresentingPicker) return;
-    _selectingSlot = 0;
+    _selectingSlot = 0;   // 0 = 临时替换
     [self presentPicker];
 }
 
@@ -488,6 +502,7 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
     }
 }
 
+// ★ 核心：pendingSlot == 0 → 临时替换；>=1 → 添加槽位（不激活）
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     _isPresentingPicker = NO;
     NSInteger pendingSlot = _selectingSlot;
@@ -499,14 +514,23 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
         if (!ss) return;
         if (results.count == 0) return;
 
+        // 确定目标和语义
         NSInteger slot = pendingSlot;
-        if (slot < 1 || slot > kQMSlotCount) {
-            NSInteger active = [QMReadSettings()[kQMActiveSlotKey] integerValue];
-            if (active >= 1 && active <= kQMSlotCount) slot = active;
-            else {
-                slot = [ss nextEmptySlot];
-                if (slot == 0) slot = 1;
-            }
+        NSString *dst = nil;
+        BOOL isTemp = NO;
+
+        if (slot == 0) {
+            // 设置 tab 的"选择图片/视频" → 临时替换
+            dst = [kQMMediaDir stringByAppendingPathComponent:@"vcam_temp.mov"];
+            isTemp = YES;
+        } else if (slot >= 1 && slot <= kQMSlotCount) {
+            // 添加槽位 → 只写文件不激活
+            dst = QMSlotPath(slot);
+        } else {
+            // 兜底：找空槽
+            slot = [ss nextEmptySlot];
+            if (slot == 0) slot = 1;
+            dst = QMSlotPath(slot);
         }
 
         PHPickerResult *res = results.firstObject;
@@ -518,6 +542,9 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
         if (!type) { [ss toast:@"无法识别媒体类型"]; return; }
 
         NSInteger capturedSlot = slot;
+        BOOL capturedTemp = isTemp;
+        NSString *capturedDst = dst;
+
         [prov loadFileRepresentationForTypeIdentifier:type
                                     completionHandler:^(NSURL *url, NSError *err) {
             if (!url) {
@@ -543,11 +570,14 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
 
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                 NSFileManager *fm = [NSFileManager defaultManager];
-                NSString *dst = QMSlotPath(capturedSlot);
-                [fm removeItemAtPath:QMSlotPathLegacy(capturedSlot) error:nil];
-                [fm removeItemAtPath:dst error:nil];
+                // 清理旧文件
+                if (!capturedTemp) {
+                    [fm removeItemAtPath:QMSlotPathLegacy(capturedSlot) error:nil];
+                }
+                [fm removeItemAtPath:capturedDst error:nil];
+
                 NSError *mvErr = nil;
-                if (![fm moveItemAtPath:safeTmp toPath:dst error:&mvErr]) {
+                if (![fm moveItemAtPath:safeTmp toPath:capturedDst error:&mvErr]) {
                     NSLog(@"[QMEnhancer] 落盘失败: %@", mvErr);
                     [fm removeItemAtPath:safeTmp error:nil];
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -555,21 +585,28 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
                     });
                     return;
                 }
-                // ★ 权限 0666，mediaserverd 可读
-                [fm setAttributes:@{NSFilePosixPermissions: @0666} ofItemAtPath:dst error:nil];
+                // ★ 0666 权限
+                [fm setAttributes:@{NSFilePosixPermissions: @0666} ofItemAtPath:capturedDst error:nil];
 
-                QMUpdateSettings(^(NSMutableDictionary *s) {
-                    s[kQMActiveSlotKey] = @(capturedSlot);
-                    s[kQMMediaPathKey]  = dst;
-                    s[kQMEnabledKey]    = @YES;
-                });
-                NSLog(@"[QMEnhancer] 槽位 %ld 落盘 %@ (%@)", (long)capturedSlot, dst,
-                      QMPathLooksLikeImage(dst) ? @"image" : @"video");
+                if (capturedTemp) {
+                    // 临时替换：切换 mediaPath（让桥接加载）
+                    QMUpdateSettings(^(NSMutableDictionary *s) {
+                        s[kQMMediaPathKey] = capturedDst;
+                        s[kQMEnabledKey]   = @YES;
+                    });
+                    NSLog(@"[QMEnhancer] 临时替换: %@", capturedDst);
+                } else {
+                    // ★ 添加槽位：只写文件，不动 activeSlot / mediaPath
+                    NSLog(@"[QMEnhancer] 槽位 %ld 已保存(未激活): %@", (long)capturedSlot, capturedDst);
+                }
+
                 dispatch_async(dispatch_get_main_queue(), ^{
                     typeof(ws) s2 = ws;
                     if (s2) {
                         [s2 updateSlotButtons];
-                        [s2 toast:[NSString stringWithFormat:@"槽位 %ld 已就绪", (long)capturedSlot]];
+                        [s2 toast:capturedTemp
+                            ? @"临时替换已就绪"
+                            : [NSString stringWithFormat:@"槽位 %ld 已保存（点击槽位激活）", (long)capturedSlot]];
                     }
                 });
             });
