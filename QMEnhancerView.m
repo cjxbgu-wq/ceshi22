@@ -7,10 +7,10 @@
 #import <stdlib.h>
 
 // ============================================================
-//  路径（跨进程共享）
+//  路径（★ 改为 mediaserverd 容器）
 // ============================================================
-static NSString *const kQMSharedSettingsPath = @"/var/mobile/Media/DCIM/vc.plist";
-static NSString *const kQMMediaDir            = @"/var/mobile/Media/DCIM";
+static NSString *const kQMSharedSettingsPath = @"/var/mobile/Library/Caches/com.apple.mediaserverd/vc.plist";
+static NSString *const kQMMediaDir            = @"/var/mobile/Library/Caches/com.apple.mediaserverd";
 static NSString *const kQMRotationKey         = @"videoRotationLV";
 static NSString *const kQMScaleKey            = @"videoScaleLV";
 static NSString *const kQMEnabledKey          = @"enabled";
@@ -33,10 +33,12 @@ static void QMEnsureDir(void) {
       withIntermediateDirectories:YES attributes:nil error:&err];
         if (err) NSLog(@"[QMEnhancer] 建目录失败: %@", err);
     }
+    [fm setAttributes:@{NSFilePosixPermissions: @0777}
+         ofItemAtPath:kQMMediaDir error:nil];
 }
 
 // ============================================================
-//  设置读写（含原子读改写）
+//  设置读写
 // ============================================================
 static NSDictionary *QMReadSettings(void) {
     @try {
@@ -53,6 +55,8 @@ static void QMWriteSettingsLocked(NSDictionary *d) {
         NSLog(@"[QMEnhancer] 写 plist 失败");
         return;
     }
+    [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0666}
+                                     ofItemAtPath:kQMSharedSettingsPath error:nil];
     notify_post(kQMNotifyName);
 }
 
@@ -84,10 +88,11 @@ static BOOL QMReadEnabled(void) {
 }
 static NSString *QMSlotPath(NSInteger slot) {
     return [kQMMediaDir stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"vcam_slot_%ld", (long)slot]];
+            [NSString stringWithFormat:@"vcam_slot_%ld.mov", (long)slot]];
 }
 static NSString *QMSlotPathLegacy(NSInteger slot) {
-    return [QMSlotPath(slot) stringByAppendingString:@".mp4"];
+    return [kQMMediaDir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"vcam_slot_%ld", (long)slot]];
 }
 
 static BOOL QMPathLooksLikeImage(NSString *path) {
@@ -550,6 +555,9 @@ static BOOL QMPathLooksLikeImage(NSString *path) {
                     });
                     return;
                 }
+                // ★ 权限 0666，mediaserverd 可读
+                [fm setAttributes:@{NSFilePosixPermissions: @0666} ofItemAtPath:dst error:nil];
+
                 QMUpdateSettings(^(NSMutableDictionary *s) {
                     s[kQMActiveSlotKey] = @(capturedSlot);
                     s[kQMMediaPathKey]  = dst;
