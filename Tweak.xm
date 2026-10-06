@@ -1,3 +1,5 @@
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <CoreVideo/CoreVideo.h>
@@ -6,6 +8,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
 #import <math.h>
 #import <string.h>
 #import <stdlib.h>
@@ -16,7 +19,7 @@
 #import "QMEnhancerView.h"
 
 // ============================================================
-//  日志（保持原样）
+//  日志
 // ============================================================
 static NSString *gVLOGPath = nil;
 static pthread_mutex_t gVLOGLock = PTHREAD_MUTEX_INITIALIZER;
@@ -39,7 +42,7 @@ static void VLOGInit(void) {
     pthread_mutex_unlock(&gVLOGLock); \
 } while(0)
 
-// ============ 路径常量（保持原样）============
+// ============ 路径常量 ============
 static NSString *const VPMSharedSettingsPath = @"/var/mobile/Media/DCIM/vc.plist";
 static NSString *const VPMMediaDir           = @"/var/mobile/Media/DCIM";
 static NSString *const VPMRotationKey        = @"videoRotationLV";
@@ -74,8 +77,7 @@ static CGFloat VPMReadScale(void) {
 }
 
 // ============================================================
-//  【新增】LocalVideoPlayer — VCam 底座（内嵌，不新增文件）
-//  提供 Tweak 里的帧钩子/桥接所需的类与方法
+//  【内嵌】LocalVideoPlayer — VCam 底座
 // ============================================================
 @interface LocalVideoPlayer : NSObject
 @property (nonatomic, copy)   NSString *mediaPath;
@@ -87,6 +89,21 @@ static CGFloat VPMReadScale(void) {
 @property (nonatomic)         BOOL playing;
 @property (nonatomic)         BOOL isVideo;
 @property (nonatomic)         BOOL shouldStop;
+
++ (instancetype)shared;
+
+- (void)updateCurrentBuffer:(CVBufferRef)buffer;
+- (void)loadMediaAtPath:(NSString *)path completion:(void (^)(BOOL success))completion;
+- (void)loadVideoAtPath:(NSString *)path completion:(void (^)(BOOL success))completion;
+- (void)loadImageAtPath:(NSString *)path completion:(void (^)(BOOL success))completion;
+- (void)play;
+- (void)pause;
+- (void)stop;
+- (CVBufferRef)currentFrame;
+
+// 内部方法（同文件调用，显式声明避免警告）
+- (void)setupVideoReader:(NSString *)path;
+- (BOOL)decodeOneFrame;
 @end
 
 @implementation LocalVideoPlayer
@@ -136,7 +153,7 @@ static CGFloat VPMReadScale(void) {
     if (!fh) { VLOG(@"媒体文件不存在: %@", path); if (completion) completion(NO); return; }
     NSData *head = [fh readDataOfLength:12];
     [fh closeFile];
-    const uint8_t *b = head.bytes;
+    const uint8_t *b = (const uint8_t *)head.bytes;   // ★ 修复: 强转
     if (head.length >= 12) {
         if (b[4]=='f'&&b[5]=='t'&&b[6]=='y'&&b[7]=='p') { [self loadVideoAtPath:path completion:completion]; return; }
         if (b[0]==0xFF&&b[1]==0xD8&&b[2]==0xFF)          { [self loadImageAtPath:path completion:completion]; return; }
@@ -276,7 +293,8 @@ static CGFloat VPMReadScale(void) {
     return YES;
 }
 
-// 帧钩子挂载点（会被本文件的 VPMUpdateCurrentBufferHook 包裹）
+#pragma mark - 帧接收（帧钩子挂载点）
+
 - (void)updateCurrentBuffer:(CVBufferRef)buffer {
     if (!buffer) return;
     [_lock lock];
@@ -298,9 +316,7 @@ static CGFloat VPMReadScale(void) {
 @end
 
 // ============================================================
-//  【新增】相机管线替换（内嵌，不新增文件）
-//  在 mediaserverd 里 hook BWNodeOutput.emitSampleBuffer:
-//  把 LocalVideoPlayer.currentFrame 就地 transfer 进相机 buffer
+//  【内嵌】相机管线替换 hook
 // ============================================================
 static VTPixelTransferSessionRef gQMPipelineTransfer = NULL;
 static void (*origQMEmitSampleBuffer)(id, SEL, CMSampleBufferRef) = NULL;
@@ -372,7 +388,7 @@ static void QMPipelineInstall(void) {
 }
 
 // ============================================================
-//  帧处理（保持原样，一行不动）
+//  帧处理（旋转/缩放）
 // ============================================================
 static uint8_t *gRotSnap = NULL;
 static size_t   gRotSnapCap = 0;
@@ -438,7 +454,7 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat sc
 }
 
 // ============================================================
-//  帧钩子（保持原样）
+//  帧钩子
 // ============================================================
 static void (*origUpdateCurrentBuffer)(id, SEL, CVBufferRef) = NULL;
 static volatile int64_t VPMFramesSeen = 0;
@@ -504,7 +520,7 @@ static void VPMInstallFrameHook(void) {
 }
 
 // ============================================================
-//  桥接（保持原样）
+//  桥接
 // ============================================================
 typedef void (^VLCompletion)(BOOL);
 static VLCompletion gNoopCompletion = NULL;
@@ -606,7 +622,7 @@ static void VPMStartBridgePolling(void) {
 }
 
 // ============================================================
-//  引导（保持原样）
+//  引导
 // ============================================================
 static void VPMScheduleBootstrap(int attempt) {
     if (VPMFrameInstalled) return;
@@ -631,7 +647,7 @@ static void VPMScheduleBootstrap(int attempt) {
 }
 
 // ============================================================
-//  SpringBoard 启动后 → 显示悬浮球（保持原样）
+//  SpringBoard 启动后 → 显示悬浮球
 // ============================================================
 %hook SpringBoard
 
@@ -663,7 +679,7 @@ static void VPMScheduleBootstrap(int attempt) {
         VLOG(@"LocalVideoPlayer: %@", lvClass ? @"存在" : @"不存在");
         VLOG(@"========================================");
 
-        // 【新增】mediaserverd 内安装相机管线替换 hook
+        // mediaserverd 内安装相机管线替换 hook
         if ([proc isEqualToString:@"mediaserverd"]) {
             QMPipelineInstall();
         }
