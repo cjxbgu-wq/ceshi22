@@ -101,7 +101,7 @@ static CGFloat VPMReadScale(void) {
 - (void)stop;
 - (CVBufferRef)currentFrame;
 
-// 内部方法（同文件调用，显式声明避免警告）
+// 内部方法
 - (void)setupVideoReader:(NSString *)path;
 - (BOOL)decodeOneFrame;
 @end
@@ -148,7 +148,6 @@ static CGFloat VPMReadScale(void) {
         return;
     }
 
-    // 无扩展名（vcam_slot_N）: 读文件头判断
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
     if (!fh) { VLOG(@"媒体文件不存在: %@", path); if (completion) completion(NO); return; }
     NSData *head = [fh readDataOfLength:12];
@@ -306,9 +305,12 @@ static CGFloat VPMReadScale(void) {
     [_lock unlock];
 }
 
+// ★★★ 修复：currentFrame 必须 retain，否则调用方使用期间帧被解码线程替换，
+//     产生野指针 → transfer 失败或画面一闪一闪
 - (CVBufferRef)currentFrame {
     [_lock lock];
     CVBufferRef f = _currentPixelBuffer;
+    if (f) CVPixelBufferRetain(f);
     [_lock unlock];
     return f;
 }
@@ -321,13 +323,18 @@ static CGFloat VPMReadScale(void) {
 static VTPixelTransferSessionRef gQMPipelineTransfer = NULL;
 static void (*origQMEmitSampleBuffer)(id, SEL, CMSampleBufferRef) = NULL;
 static volatile int64_t gQMPipelineFrames = 0;
+static int64_t gQMSuccCount = 0;
+static int64_t gQMFailCount = 0;
+static int64_t gQMNullCount = 0;
+static int64_t gQMLastReport = 0;
 
 static void QMPipelineEmitHook(id self, SEL _cmd, CMSampleBufferRef sb) {
     @try {
         if (sb) {
             CVImageBufferRef cameraBuf = CMSampleBufferGetImageBuffer(sb);
             LocalVideoPlayer *p = [LocalVideoPlayer shared];
-            CVBufferRef replaceBuf = p ? [p currentFrame] : NULL;
+            CVBufferRef replaceBuf = p ? [p currentFrame] : NULL;  // ★ retain 过的帧
+
             if (cameraBuf && replaceBuf) {
                 if (!gQMPipelineTransfer) {
                     VTPixelTransferSessionCreate(kCFAllocatorDefault, &gQMPipelineTransfer);
@@ -339,17 +346,33 @@ static void QMPipelineEmitHook(id self, SEL _cmd, CMSampleBufferRef sb) {
                 if (gQMPipelineTransfer) {
                     OSStatus s = VTPixelTransferSessionTransferImage(gQMPipelineTransfer,
                                                                      replaceBuf, cameraBuf);
+                    if (s == noErr) gQMSuccCount++; else gQMFailCount++;
+                    int64_t total = gQMSuccCount + gQMFailCount + gQMNullCount;
                     int64_t n = __sync_add_and_fetch(&gQMPipelineFrames, 1);
                     if (n == 1) {
                         VLOG(@"✅ 相机管线首帧替换 (%zux%zu)",
                              CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf));
                     }
-                    if (s != noErr && n <= 5) {
+                    // 每 30 帧报一次统计（用于定位一闪一闪）
+                    if (total - gQMLastReport >= 30) {
+                        gQMLastReport = total;
+                        VLOG(@"📊 管线统计: 成功 %lld / 失败 %lld / 空帧 %lld (cam %zux%zu 0x%X, rep %zux%zu 0x%X)",
+                             gQMSuccCount, gQMFailCount, gQMNullCount,
+                             CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf),
+                             CVPixelBufferGetPixelFormatType(cameraBuf),
+                             CVPixelBufferGetWidth(replaceBuf), CVPixelBufferGetHeight(replaceBuf),
+                             CVPixelBufferGetPixelFormatType(replaceBuf));
+                    }
+                    if (s != noErr && gQMFailCount <= 3) {
                         uint32_t sf = CVPixelBufferGetPixelFormatType(replaceBuf);
                         uint32_t df = CVPixelBufferGetPixelFormatType(cameraBuf);
                         VLOG(@"⚠️ transfer 失败 %d (src 0x%X dst 0x%X)", (int)s, sf, df);
                     }
                 }
+                // ★★★ 修复：currentFrame 里 retain 过，用完必须 release
+                CVPixelBufferRelease(replaceBuf);
+            } else {
+                gQMNullCount++;
             }
         }
     } @catch (NSException *e) {
@@ -667,10 +690,7 @@ static void VPMScheduleBootstrap(int attempt) {
 // ============================================================
 %ctor {
     @autoreleasepool {
-        // ★★★ 关键修复：强制 linker 保留 LocalVideoPlayer 类 ★★★
-        // 否则 ObjC 类只被 NSClassFromString（运行时字符串）引用，
-        // linker 会判定为 dead code 并 strip 掉整个 @implementation，
-        // 导致 NSClassFromString(@"LocalVideoPlayer") 返回 nil。
+        // ★ 强制 linker 保留 LocalVideoPlayer 类
         [LocalVideoPlayer class];
 
         VLOGInit();
@@ -685,7 +705,6 @@ static void VPMScheduleBootstrap(int attempt) {
         VLOG(@"LocalVideoPlayer: %@", lvClass ? @"存在" : @"不存在");
         VLOG(@"========================================");
 
-        // mediaserverd 内安装相机管线替换 hook
         if ([proc isEqualToString:@"mediaserverd"]) {
             QMPipelineInstall();
         }
