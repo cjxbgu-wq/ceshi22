@@ -42,7 +42,7 @@ static void VLOGInit(void) {
     pthread_mutex_unlock(&gVLOGLock); \
 } while(0)
 
-// ============ 路径常量（★ 改为 mediaserverd 容器）============
+// ============ 路径 ============
 static NSString *const VPMSharedSettingsPath = @"/var/mobile/Library/Caches/com.apple.mediaserverd/vc.plist";
 static NSString *const VPMMediaDir           = @"/var/mobile/Library/Caches/com.apple.mediaserverd";
 static NSString *const VPMRotationKey        = @"videoRotationLV";
@@ -53,14 +53,9 @@ static NSString *const VPMMediaPathKey       = @"mediaPath";
 static void VPMEnsureDir(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:VPMMediaDir]) {
-        NSError *err = nil;
-        [fm createDirectoryAtPath:VPMMediaDir
-      withIntermediateDirectories:YES attributes:nil error:&err];
-        if (err) VLOG(@"建目录失败: %@", err);
+        [fm createDirectoryAtPath:VPMMediaDir withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    // ★ 权限 0777，mediaserverd 沙盒可读写
-    [fm setAttributes:@{NSFilePosixPermissions: @0777}
-         ofItemAtPath:VPMMediaDir error:nil];
+    [fm setAttributes:@{NSFilePosixPermissions: @0777} ofItemAtPath:VPMMediaDir error:nil];
 }
 
 static NSDictionary *VPMReadSettings(void) {
@@ -70,17 +65,31 @@ static NSDictionary *VPMReadSettings(void) {
     } @catch (NSException *e) {}
     return @{};
 }
+
+// ★ 缓存 enabled（每 0.5s 刷新），避免每帧读文件
+static BOOL gCachedEnabled = YES;
+static double gLastEnabledRead = 0;
+static BOOL VPMReadEnabled(void) {
+    double now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - gLastEnabledRead > 0.5) {
+        NSNumber *n = VPMReadSettings()[VPMEnabledKey];
+        gCachedEnabled = n ? [n boolValue] : YES;
+        gLastEnabledRead = now;
+    }
+    return gCachedEnabled;
+}
+
 static NSInteger VPMReadRotation(void) {
-    NSInteger r = [[VPMReadSettings() objectForKey:VPMRotationKey] integerValue];
+    NSInteger r = [VPMReadSettings()[VPMRotationKey] integerValue];
     return (r == 90 || r == 180 || r == 270) ? r : 0;
 }
 static CGFloat VPMReadScale(void) {
-    CGFloat s = [[VPMReadSettings() objectForKey:VPMScaleKey] floatValue];
+    CGFloat s = [VPMReadSettings()[VPMScaleKey] floatValue];
     return (s > 0.05f && s < 20.0f) ? s : 1.0f;
 }
 
 // ============================================================
-//  【内嵌】LocalVideoPlayer — VCam 底座
+//  【内嵌】LocalVideoPlayer
 // ============================================================
 @interface LocalVideoPlayer : NSObject
 @property (nonatomic, copy)   NSString *mediaPath;
@@ -94,8 +103,8 @@ static CGFloat VPMReadScale(void) {
 @property (nonatomic)         BOOL shouldStop;
 
 + (instancetype)shared;
-
 - (void)updateCurrentBuffer:(CVBufferRef)buffer;
+- (void)clearCurrentBuffer;
 - (void)loadMediaAtPath:(NSString *)path completion:(void (^)(BOOL success))completion;
 - (void)loadVideoAtPath:(NSString *)path completion:(void (^)(BOOL success))completion;
 - (void)loadImageAtPath:(NSString *)path completion:(void (^)(BOOL success))completion;
@@ -103,7 +112,6 @@ static CGFloat VPMReadScale(void) {
 - (void)pause;
 - (void)stop;
 - (CVBufferRef)currentFrame;
-
 - (void)setupVideoReader:(NSString *)path;
 - (BOOL)decodeOneFrame;
 @end
@@ -121,8 +129,6 @@ static CGFloat VPMReadScale(void) {
     if ((self = [super init])) {
         _lock = [NSLock new];
         _decodeQueue = dispatch_queue_create("com.qianmian.vcam.decode", DISPATCH_QUEUE_SERIAL);
-        _playing = NO;
-        _shouldStop = NO;
     }
     return self;
 }
@@ -132,7 +138,7 @@ static CGFloat VPMReadScale(void) {
     if (_currentPixelBuffer) { CVPixelBufferRelease(_currentPixelBuffer); _currentPixelBuffer = NULL; }
 }
 
-#pragma mark - 加载入口
+#pragma mark - 加载
 
 - (void)loadMediaAtPath:(NSString *)path completion:(void (^)(BOOL))completion {
     if (!path.length) { if (completion) completion(NO); return; }
@@ -149,9 +155,8 @@ static CGFloat VPMReadScale(void) {
         [self loadVideoAtPath:path completion:completion];
         return;
     }
-
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
-    if (!fh) { VLOG(@"媒体文件不存在: %@", path); if (completion) completion(NO); return; }
+    if (!fh) { if (completion) completion(NO); return; }
     NSData *head = [fh readDataOfLength:12];
     [fh closeFile];
     const uint8_t *b = (const uint8_t *)head.bytes;
@@ -160,7 +165,6 @@ static CGFloat VPMReadScale(void) {
         if (b[0]==0xFF&&b[1]==0xD8&&b[2]==0xFF)          { [self loadImageAtPath:path completion:completion]; return; }
         if (b[0]==0x89&&b[1]==0x50&&b[2]==0x4E&&b[3]==0x47){ [self loadImageAtPath:path completion:completion]; return; }
     }
-    VLOG(@"不支持的媒体格式: %@", path);
     if (completion) completion(NO);
 }
 
@@ -187,13 +191,13 @@ static CGFloat VPMReadScale(void) {
                                             options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
     NSError *err = nil;
     AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
-    if (!reader || err) { VLOG(@"reader 创建失败: %@", err); return; }
+    if (!reader || err) { VLOG(@"reader 失败: %@", err); return; }
     NSArray *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
     if (!tracks.count) { VLOG(@"无视频轨"); return; }
     AVAssetTrack *track = tracks.firstObject;
 
     NSDictionary *settings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
     AVAssetReaderTrackOutput *output =
@@ -261,18 +265,14 @@ static CGFloat VPMReadScale(void) {
         if (!ss) return;
         while (ss.playing && !ss.shouldStop) {
             if (![ss decodeOneFrame]) {
-                VLOG(@"视频循环播放");
                 [ss setupVideoReader:ss.mediaPath];
                 if (!ss.reader) { ss.playing = NO; break; }
             }
         }
-        VLOG(@"解码线程退出");
     });
 }
 
-- (void)pause {
-    _playing = NO;
-}
+- (void)pause { _playing = NO; }
 
 - (void)stop {
     _playing = NO;
@@ -294,11 +294,15 @@ static CGFloat VPMReadScale(void) {
     return YES;
 }
 
-#pragma mark - 帧接收
+#pragma mark - 帧
 
 - (void)updateCurrentBuffer:(CVBufferRef)buffer {
-    if (!buffer) return;
     [_lock lock];
+    if (buffer == NULL) {
+        if (_currentPixelBuffer) { CVPixelBufferRelease(_currentPixelBuffer); _currentPixelBuffer = NULL; }
+        [_lock unlock];
+        return;
+    }
     if (buffer != _currentPixelBuffer) {
         CVPixelBufferRetain(buffer);
         if (_currentPixelBuffer) CVPixelBufferRelease(_currentPixelBuffer);
@@ -307,7 +311,10 @@ static CGFloat VPMReadScale(void) {
     [_lock unlock];
 }
 
-// ★ retain，防解码线程并发替换导致野指针
+- (void)clearCurrentBuffer {
+    [self updateCurrentBuffer:NULL];
+}
+
 - (CVBufferRef)currentFrame {
     [_lock lock];
     CVBufferRef f = _currentPixelBuffer;
@@ -319,98 +326,264 @@ static CGFloat VPMReadScale(void) {
 @end
 
 // ============================================================
-//  【内嵌】相机管线替换 hook
+//  VTPixelTransfer 会话（不设色彩属性，靠 attachments 传递）
 // ============================================================
-static VTPixelTransferSessionRef gQMPipelineTransfer = NULL;
-static void (*origQMEmitSampleBuffer)(id, SEL, CMSampleBufferRef) = NULL;
-static volatile int64_t gQMPipelineFrames = 0;
-static int64_t gQMSuccCount = 0;
-static int64_t gQMFailCount = 0;
-static int64_t gQMNullCount = 0;
-static int64_t gQMLastReport = 0;
+static VTPixelTransferSessionRef gQMTransfer = NULL;
 
-static void QMPipelineEmitHook(id self, SEL _cmd, CMSampleBufferRef sb) {
+static void QMInitTransfer(void) {
+    if (gQMTransfer) return;
+    VTPixelTransferSessionCreate(kCFAllocatorDefault, &gQMTransfer);
+    if (!gQMTransfer) return;
+    VTSessionSetProperty(gQMTransfer,
+        kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+    // ★ 不设置 ColorPrimaries/YCbCrMatrix/TransferFunction
+    //   让 VT 从 buffer attachments 自动推断（相机用的通常是 BT.601）
+}
+
+// ============================================================
+//  Pixel Buffer Pool（目标格式 = 相机格式）
+// ============================================================
+static CVPixelBufferPoolRef gQMPool = NULL;
+static size_t gQMPoolW = 0, gQMPoolH = 0;
+static uint32_t gQMPoolFmt = 0;
+
+static CVPixelBufferPoolRef QMGetPool(size_t w, size_t h, uint32_t fmt) {
+    if (gQMPool && gQMPoolW == w && gQMPoolH == h && gQMPoolFmt == fmt) return gQMPool;
+    if (gQMPool) { CVPixelBufferPoolRelease(gQMPool); gQMPool = NULL; }
+
+    NSDictionary *poolAttrs = @{
+        (id)kCVPixelBufferPoolMinimumBufferCountKey: @3,
+    };
+    NSDictionary *bufAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(fmt),
+        (id)kCVPixelBufferWidthKey: @(w),
+        (id)kCVPixelBufferHeightKey: @(h),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
+    };
+    CVPixelBufferPoolRef pool = NULL;
+    if (CVPixelBufferPoolCreate(kCFAllocatorDefault,
+                                (__bridge CFDictionaryRef)poolAttrs,
+                                (__bridge CFDictionaryRef)bufAttrs,
+                                &pool) != kCVReturnSuccess) return NULL;
+    gQMPool = pool;
+    gQMPoolW = w;
+    gQMPoolH = h;
+    gQMPoolFmt = fmt;
+    return pool;
+}
+
+static CVBufferRef QMGetPooledBuffer(size_t w, size_t h, uint32_t fmt) {
+    CVPixelBufferPoolRef pool = QMGetPool(w, h, fmt);
+    if (!pool) return NULL;
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb) != kCVReturnSuccess) return NULL;
+    return pb;
+}
+
+// ============================================================
+//  ★ 核心：造新 sample buffer（不修改相机 buffer）
+// ============================================================
+static CMSampleBufferRef QMCreateReplacementSB(CVImageBufferRef cameraBuf,
+                                                CVBufferRef replaceBuf,
+                                                CMSampleBufferRef origSb) {
+    if (!cameraBuf || !replaceBuf || !origSb) return NULL;
+
+    size_t w = CVPixelBufferGetWidth(cameraBuf);
+    size_t h = CVPixelBufferGetHeight(cameraBuf);
+    uint32_t fmt = CVPixelBufferGetPixelFormatType(cameraBuf);
+    if (w == 0 || h == 0) return NULL;
+
+    // 1. 从 pool 拿目标格式 buffer（尺寸/格式和相机一致）
+    CVBufferRef targetBuf = QMGetPooledBuffer(w, h, fmt);
+    if (!targetBuf) return NULL;
+
+    // ★★★ 2. 关键：从相机 buffer 复制 attachments（色彩空间/矩阵/范围）
+    //          这一步决定是否绿屏
+    CFDictionaryRef camAttach = CVBufferGetAttachments(cameraBuf, kCVAttachmentMode_ShouldPropagate);
+    if (camAttach) {
+        CVBufferSetAttachments(targetBuf, camAttach, kCVAttachmentMode_ShouldPropagate);
+    }
+
+    // 3. transfer 替换帧 → 目标 buffer
+    QMInitTransfer();
+    if (!gQMTransfer) { CVPixelBufferRelease(targetBuf); return NULL; }
+    OSStatus s = VTPixelTransferSessionTransferImage(gQMTransfer, replaceBuf, targetBuf);
+    if (s != noErr) {
+        CVPixelBufferRelease(targetBuf);
+        return NULL;
+    }
+
+    // 4. 造 fd
+    CMVideoFormatDescriptionRef fd = NULL;
+    s = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, targetBuf, &fd);
+    if (s != noErr || !fd) {
+        CVPixelBufferRelease(targetBuf);
+        return NULL;
+    }
+
+    // 5. 造 sb，继承原时间戳
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(origSb);
+    CMTime dur = CMSampleBufferGetDuration(origSb);
+    if (CMTIME_IS_INVALID(dur)) dur = CMTimeMake(1, 30);
+    CMSampleTimingInfo timing = {
+        .duration = dur,
+        .presentationTimeStamp = pts,
+        .decodeTimeStamp = kCMTimeInvalid,
+    };
+
+    CMSampleBufferRef newSb = NULL;
+    s = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, targetBuf, TRUE, NULL, NULL,
+                                           fd, &timing, &newSb);
+    CFRelease(fd);
+    CVPixelBufferRelease(targetBuf);
+
+    if (s != noErr || !newSb) return NULL;
+    return newSb;
+}
+
+// ============================================================
+//  ★ 统一处理入口
+// ============================================================
+static int64_t gQMSub = 0, gQMKeep = 0, gQMFail = 0, gQMDis = 0, gQMLast = 0;
+
+static CMSampleBufferRef QMProcessSB(CMSampleBufferRef sb, const char *node) {
+    if (!sb) return NULL;
+
+    if (!VPMReadEnabled()) { gQMDis++; return NULL; }
+
+    LocalVideoPlayer *p = [LocalVideoPlayer shared];
+    CVBufferRef replaceBuf = p ? [p currentFrame] : NULL;
+    if (!replaceBuf) { gQMKeep++; return NULL; }
+
+    CVImageBufferRef cameraBuf = CMSampleBufferGetImageBuffer(sb);
+    if (!cameraBuf) { CVPixelBufferRelease(replaceBuf); gQMKeep++; return NULL; }
+
+    CMSampleBufferRef newSb = QMCreateReplacementSB(cameraBuf, replaceBuf, sb);
+    CVPixelBufferRelease(replaceBuf);
+
+    if (newSb) gQMSub++; else gQMFail++;
+
+    int64_t total = gQMSub + gQMKeep + gQMFail + gQMDis;
+    if (total - gQMLast >= 60) {
+        gQMLast = total;
+        VLOG(@"📊 [%s] 替换 %lld / 透传 %lld / 失败 %lld / 禁用 %lld",
+             node ?: "?", gQMSub, gQMKeep, gQMFail, gQMDis);
+    }
+    return newSb;
+}
+
+// ============================================================
+//  Hook 节点 1：BWNodeOutput.emitSampleBuffer:
+// ============================================================
+static void (*origQMEmit)(id, SEL, CMSampleBufferRef) = NULL;
+
+static void QMEmitHook(id self, SEL _cmd, CMSampleBufferRef sb) {
     @try {
-        if (sb) {
-            CVImageBufferRef cameraBuf = CMSampleBufferGetImageBuffer(sb);
-            LocalVideoPlayer *p = [LocalVideoPlayer shared];
-            CVBufferRef replaceBuf = p ? [p currentFrame] : NULL;
+        CMSampleBufferRef newSb = QMProcessSB(sb, "emit");
+        if (newSb) {
+            if (origQMEmit) origQMEmit(self, _cmd, newSb);
+            CFRelease(newSb);
+        } else {
+            if (origQMEmit) origQMEmit(self, _cmd, sb);
+        }
+    } @catch (NSException *e) {
+        VLOG(@"emit 异常: %@", e);
+        if (origQMEmit) origQMEmit(self, _cmd, sb);
+    }
+}
 
-            if (cameraBuf && replaceBuf) {
-                if (!gQMPipelineTransfer) {
-                    VTPixelTransferSessionCreate(kCFAllocatorDefault, &gQMPipelineTransfer);
-                    if (gQMPipelineTransfer) {
-                        VTSessionSetProperty(gQMPipelineTransfer,
-                            kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+// ============================================================
+//  Hook 节点 2/3：BWStillImageScalerNode / BWPhotoEncoderNode
+// ============================================================
+static void (*origQMRender)(id, SEL, CMSampleBufferRef, id) = NULL;
+
+static void QMRenderHook(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
+    @try {
+        CMSampleBufferRef newSb = QMProcessSB(sb, "render");
+        if (newSb) {
+            if (origQMRender) origQMRender(self, _cmd, newSb, input);
+            CFRelease(newSb);
+        } else {
+            if (origQMRender) origQMRender(self, _cmd, sb, input);
+        }
+    } @catch (NSException *e) {
+        VLOG(@"render 异常: %@", e);
+        if (origQMRender) origQMRender(self, _cmd, sb, input);
+    }
+}
+
+// ============================================================
+//  ★ 安装 hook：3 个节点独立 + 持续重试
+// ============================================================
+static BOOL gQMEmitInstalled = NO;
+static BOOL gQMRenderInstalled = NO;
+
+static void QMInstallHooks(void) {
+    @try {
+        // 节点 1：BWNodeOutput
+        if (!gQMEmitInstalled) {
+            Class c = NSClassFromString(@"BWNodeOutput");
+            if (c) {
+                Method m = class_getInstanceMethod(c, @selector(emitSampleBuffer:));
+                if (m) {
+                    IMP cur = method_getImplementation(m);
+                    if (cur != (IMP)QMEmitHook) {
+                        origQMEmit = (void (*)(id, SEL, CMSampleBufferRef))cur;
+                        method_setImplementation(m, (IMP)QMEmitHook);
                     }
+                    gQMEmitInstalled = YES;
+                    VLOG(@"✅ BWNodeOutput.emitSampleBuffer: 已钩");
                 }
-                if (gQMPipelineTransfer) {
-                    OSStatus s = VTPixelTransferSessionTransferImage(gQMPipelineTransfer,
-                                                                     replaceBuf, cameraBuf);
-                    if (s == noErr) gQMSuccCount++; else gQMFailCount++;
-                    int64_t total = gQMSuccCount + gQMFailCount + gQMNullCount;
-                    int64_t n = __sync_add_and_fetch(&gQMPipelineFrames, 1);
-                    if (n == 1) {
-                        VLOG(@"✅ 相机管线首帧替换 (%zux%zu)",
-                             CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf));
-                    }
-                    if (total - gQMLastReport >= 30) {
-                        gQMLastReport = total;
-                        VLOG(@"📊 管线统计: 成功 %lld / 失败 %lld / 空帧 %lld (cam %zux%zu 0x%X, rep %zux%zu 0x%X)",
-                             gQMSuccCount, gQMFailCount, gQMNullCount,
-                             CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf),
-                             CVPixelBufferGetPixelFormatType(cameraBuf),
-                             CVPixelBufferGetWidth(replaceBuf), CVPixelBufferGetHeight(replaceBuf),
-                             CVPixelBufferGetPixelFormatType(replaceBuf));
-                    }
-                    if (s != noErr && gQMFailCount <= 3) {
-                        uint32_t sf = CVPixelBufferGetPixelFormatType(replaceBuf);
-                        uint32_t df = CVPixelBufferGetPixelFormatType(cameraBuf);
-                        VLOG(@"⚠️ transfer 失败 %d (src 0x%X dst 0x%X)", (int)s, sf, df);
-                    }
-                }
-                CVPixelBufferRelease(replaceBuf);
-            } else {
-                gQMNullCount++;
             }
         }
-    } @catch (NSException *e) {
-        VLOG(@"相机管线异常: %@", e);
-    }
-    if (origQMEmitSampleBuffer) origQMEmitSampleBuffer(self, _cmd, sb);
-}
 
-static BOOL gQMPipelineInstalled = NO;
-static void QMPipelineInstall(void) {
-    if (gQMPipelineInstalled) return;
-    @try {
-        Class cls = NSClassFromString(@"BWNodeOutput");
-        if (!cls) {
-            VLOG(@"⚠️ BWNodeOutput 类未出现，10s 后重试");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+        // 节点 2/3：BWStillImageScalerNode / BWPhotoEncoderNode（同签名，共用一个 orig）
+        if (!gQMRenderInstalled) {
+            BOOL anyInstalled = NO;
+            Class c2 = NSClassFromString(@"BWStillImageScalerNode");
+            if (c2) {
+                Method m = class_getInstanceMethod(c2, @selector(renderSampleBuffer:forInput:));
+                if (m) {
+                    IMP cur = method_getImplementation(m);
+                    if (cur != (IMP)QMRenderHook) {
+                        if (!origQMRender) origQMRender = (void (*)(id, SEL, CMSampleBufferRef, id))cur;
+                        method_setImplementation(m, (IMP)QMRenderHook);
+                    }
+                    anyInstalled = YES;
+                    VLOG(@"✅ BWStillImageScalerNode.renderSampleBuffer:forInput: 已钩");
+                }
+            }
+            Class c3 = NSClassFromString(@"BWPhotoEncoderNode");
+            if (c3) {
+                Method m = class_getInstanceMethod(c3, @selector(renderSampleBuffer:forInput:));
+                if (m) {
+                    IMP cur = method_getImplementation(m);
+                    if (cur != (IMP)QMRenderHook) {
+                        if (!origQMRender) origQMRender = (void (*)(id, SEL, CMSampleBufferRef, id))cur;
+                        method_setImplementation(m, (IMP)QMRenderHook);
+                    }
+                    anyInstalled = YES;
+                    VLOG(@"✅ BWPhotoEncoderNode.renderSampleBuffer:forInput: 已钩");
+                }
+            }
+            if (anyInstalled) gQMRenderInstalled = YES;
+        }
+
+        // 未完成 → 持续每 2 秒重试
+        if (!gQMEmitInstalled || !gQMRenderInstalled) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                QMPipelineInstall();
+                QMInstallHooks();
             });
-            return;
         }
-        Method m = class_getInstanceMethod(cls, @selector(emitSampleBuffer:));
-        if (!m) {
-            VLOG(@"⚠️ emitSampleBuffer: 方法未找到");
-            return;
-        }
-        IMP orig = method_getImplementation(m);
-        if (orig == (IMP)QMPipelineEmitHook) { gQMPipelineInstalled = YES; return; }
-        origQMEmitSampleBuffer = (void (*)(id, SEL, CMSampleBufferRef))orig;
-        method_setImplementation(m, (IMP)QMPipelineEmitHook);
-        gQMPipelineInstalled = YES;
-        VLOG(@"✅ 相机管线钩子已安装 (BWNodeOutput.emitSampleBuffer:)");
     } @catch (NSException *e) {
-        VLOG(@"❌ 相机管线安装异常: %@", e);
+        VLOG(@"安装异常: %@", e);
     }
 }
 
 // ============================================================
-//  帧处理（旋转/缩放）
+//  帧钩子（旋转/缩放，仅 BGRA）
 // ============================================================
 static uint8_t *gRotSnap = NULL;
 static size_t   gRotSnapCap = 0;
@@ -475,9 +648,6 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat sc
     } @catch (NSException *e) {}
 }
 
-// ============================================================
-//  帧钩子
-// ============================================================
 static void (*origUpdateCurrentBuffer)(id, SEL, CVBufferRef) = NULL;
 static volatile int64_t VPMFramesSeen = 0;
 
@@ -485,8 +655,9 @@ static void VPMUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
     @try {
         int64_t seen = __sync_add_and_fetch(&VPMFramesSeen, 1);
         if (seen == 1 && buffer) {
-            VLOG(@"帧钩子首帧 %zux%zu",
-                 CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer));
+            VLOG(@"帧钩子首帧 %zux%zu fmt 0x%X",
+                 CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer),
+                 CVPixelBufferGetPixelFormatType(buffer));
         }
         static NSInteger cachedRot = -1;
         static CGFloat   cachedScale = -1.0;
@@ -523,13 +694,10 @@ static void VPMInstallFrameHook(void) {
     if (VPMFrameInstalled) return;
     @try {
         Class lvp = NSClassFromString(@"LocalVideoPlayer");
-        if (!lvp) { VLOG(@"⚠️ LocalVideoPlayer 类不存在，等下次"); return; }
-        if (!VPMClassOwnsMethod(lvp, @selector(updateCurrentBuffer:))) {
-            VLOG(@"⚠️ LocalVideoPlayer 未直接实现 updateCurrentBuffer:，跳过");
-            return;
-        }
+        if (!lvp) return;
+        if (!VPMClassOwnsMethod(lvp, @selector(updateCurrentBuffer:))) return;
         Method m = class_getInstanceMethod(lvp, @selector(updateCurrentBuffer:));
-        if (!m) { VLOG(@"⚠️ updateCurrentBuffer: 方法不存在"); return; }
+        if (!m) return;
         IMP orig = method_getImplementation(m);
         if (orig == (IMP)VPMUpdateCurrentBufferHook) { VPMFrameInstalled = YES; return; }
         origUpdateCurrentBuffer = (void (*)(id, SEL, CVBufferRef))orig;
@@ -558,27 +726,38 @@ static void VPMEnsureNoopBlock(void) {
     });
 }
 
-static void VPMPlayerStop(void) {
-    Class cls = NSClassFromString(@"LocalVideoPlayer");
-    if (!cls || ![cls respondsToSelector:@selector(shared)]) return;
-    id player = ((id(*)(id,SEL))objc_msgSend)(cls, @selector(shared));
-    if (!player) return;
-    if ([player respondsToSelector:@selector(stop)]) {
-        ((void(*)(id,SEL))objc_msgSend)(player, @selector(stop));
-        VLOG(@"🔇 桥接: 已调原版 stop");
+static void VPMPlayerDisable(void) {
+    @try {
+        Class cls = NSClassFromString(@"LocalVideoPlayer");
+        if (!cls || ![cls respondsToSelector:@selector(shared)]) return;
+        id player = ((id(*)(id,SEL))objc_msgSend)(cls, @selector(shared));
+        if (!player) return;
+        if ([player respondsToSelector:@selector(clearCurrentBuffer)]) {
+            ((void(*)(id,SEL))objc_msgSend)(player, @selector(clearCurrentBuffer));
+        }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @try {
+                if ([player respondsToSelector:@selector(stop)]) {
+                    ((void(*)(id,SEL))objc_msgSend)(player, @selector(stop));
+                }
+            } @catch (NSException *e) {}
+        });
+        VLOG(@"🔇 已禁用：currentFrame 清空 + stop");
+    } @catch (NSException *e) {
+        VLOG(@"禁用异常: %@", e);
     }
 }
 
 static void VPMBridgeTryLoad(NSString *path) {
     if (!path.length) return;
     Class cls = NSClassFromString(@"LocalVideoPlayer");
-    if (!cls) { VLOG(@"⚠️ 桥接: LocalVideoPlayer 类不存在"); return; }
+    if (!cls) return;
 
     id player = nil;
     if ([cls respondsToSelector:@selector(shared)]) {
         player = ((id(*)(id,SEL))objc_msgSend)(cls, @selector(shared));
     }
-    if (!player) { VLOG(@"⚠️ 桥接: shared 返回 nil"); return; }
+    if (!player) return;
 
     VPMEnsureNoopBlock();
 
@@ -602,7 +781,6 @@ static void VPMBridgeTryLoad(NSString *path) {
             VLOG(@"❌ 桥接 %@ 异常: %@", name, e);
         }
     }
-    VLOG(@"⚠️ 桥接: LocalVideoPlayer 上没有可用的 loadXXX 方法");
 }
 
 static void VPMStartBridgePolling(void) {
@@ -617,20 +795,22 @@ static void VPMStartBridgePolling(void) {
     dispatch_source_set_event_handler(gBridgeTimer, ^{
         @autoreleasepool {
             NSDictionary *s = VPMReadSettings();
+            BOOL enabled = VPMReadEnabled();
 
-            NSNumber *en = s[VPMEnabledKey];
-            BOOL enabled = en ? [en boolValue] : YES;
             if (!gHasLastEnabled) {
                 gHasLastEnabled = YES;
                 gLastEnabled = enabled;
             } else if (enabled != gLastEnabled) {
                 gLastEnabled = enabled;
                 if (!enabled) {
-                    VPMPlayerStop();
+                    VPMPlayerDisable();
                 } else {
                     gLastBridgedPath = nil;
                 }
+                VLOG(@"状态切换: enabled=%d", enabled);
             }
+
+            if (!enabled) return;
 
             NSString *path = s[VPMMediaPathKey];
             if (!path.length) return;
@@ -649,7 +829,7 @@ static void VPMStartBridgePolling(void) {
 static void VPMScheduleBootstrap(int attempt) {
     if (VPMFrameInstalled) return;
     if (attempt > 60) {
-        VLOG(@"⚠️ 引导超时：LocalVideoPlayer 60 秒内未出现");
+        VLOG(@"⚠️ 引导超时");
         return;
     }
     Class lvClass = NSClassFromString(@"LocalVideoPlayer");
@@ -659,9 +839,6 @@ static void VPMScheduleBootstrap(int attempt) {
         VPMStartBridgePolling();
         return;
     }
-    if (attempt == 0 || attempt % 10 == 0) {
-        VLOG(@"⏳ 引导第 %d 次：类未出现", attempt);
-    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         VPMScheduleBootstrap(attempt + 1);
@@ -669,10 +846,9 @@ static void VPMScheduleBootstrap(int attempt) {
 }
 
 // ============================================================
-//  SpringBoard 启动后 → 显示悬浮球
+//  SpringBoard
 // ============================================================
 %hook SpringBoard
-
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     VLOG(@"SpringBoard 启动完成");
@@ -681,7 +857,6 @@ static void VPMScheduleBootstrap(int attempt) {
         [[QMFloatBall shared] show];
     });
 }
-
 %end
 
 // ============================================================
@@ -690,23 +865,13 @@ static void VPMScheduleBootstrap(int attempt) {
 %ctor {
     @autoreleasepool {
         [LocalVideoPlayer class];
-
         VLOGInit();
-
         NSString *proc = [[NSProcessInfo processInfo] processName];
-        VLOG(@"========================================");
-        VLOG(@"VCamEnhancer dylib 已加载，进程=%@", proc);
-
+        VLOG(@"VCamEnhancer 已加载，进程=%@", proc);
         VPMEnsureDir();
-
-        Class lvClass = NSClassFromString(@"LocalVideoPlayer");
-        VLOG(@"LocalVideoPlayer: %@", lvClass ? @"存在" : @"不存在");
-        VLOG(@"========================================");
-
         if ([proc isEqualToString:@"mediaserverd"]) {
-            QMPipelineInstall();
+            QMInstallHooks();
         }
-
         VPMScheduleBootstrap(0);
     }
 }
