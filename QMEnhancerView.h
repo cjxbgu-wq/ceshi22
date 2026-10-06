@@ -1,11 +1,14 @@
 #import <UIKit/UIKit.h>
-#import <CoreVideo/CoreVideo.h>
+
+@interface QMFloatBall : NSObject
++ (instancetype)shared;
+- (void)show;
+- (void)hide;
+@end
 
 @interface QMEnhancerView : UIView
-
-// 由 Tweak.xm 挂载时设置，指向原版 VCamSettingsViewController
+// 由 QMFloatBall 注入，用于 present PHPicker
+@property (nonatomic, weak) UIWindow *hostWindow;
+// 兼容旧接口（保留，勿删）
 @property (nonatomic, weak) UIViewController *panelVC;
-
-+ (void)processFrame:(CVPixelBufferRef)pixelBuffer;
-
 @end
