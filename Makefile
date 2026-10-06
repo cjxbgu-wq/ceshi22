@@ -9,7 +9,7 @@ TWEAK_NAME = QianmianEnhancer
 QianmianEnhancer_FILES = Tweak.xm \
     QMEnhancerView.m
 
-QianmianEnhancer_CFLAGS = -fobjc-arc
+QianmianEnhancer_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-unused-variable -Wno-deprecated-declarations
 QianmianEnhancer_FRAMEWORKS = UIKit Foundation CoreVideo CoreMedia VideoToolbox CoreImage AVFoundation QuartzCore PhotosUI ImageIO
 QianmianEnhancer_PRIVATE_FRAMEWORKS =
 QianmianEnhancer_LIBRARIES = substrate
