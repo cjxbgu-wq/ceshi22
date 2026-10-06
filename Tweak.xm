@@ -153,7 +153,7 @@ static CGFloat VPMReadScale(void) {
     if (!fh) { VLOG(@"媒体文件不存在: %@", path); if (completion) completion(NO); return; }
     NSData *head = [fh readDataOfLength:12];
     [fh closeFile];
-    const uint8_t *b = (const uint8_t *)head.bytes;   // ★ 修复: 强转
+    const uint8_t *b = (const uint8_t *)head.bytes;
     if (head.length >= 12) {
         if (b[4]=='f'&&b[5]=='t'&&b[6]=='y'&&b[7]=='p') { [self loadVideoAtPath:path completion:completion]; return; }
         if (b[0]==0xFF&&b[1]==0xD8&&b[2]==0xFF)          { [self loadImageAtPath:path completion:completion]; return; }
@@ -667,6 +667,12 @@ static void VPMScheduleBootstrap(int attempt) {
 // ============================================================
 %ctor {
     @autoreleasepool {
+        // ★★★ 关键修复：强制 linker 保留 LocalVideoPlayer 类 ★★★
+        // 否则 ObjC 类只被 NSClassFromString（运行时字符串）引用，
+        // linker 会判定为 dead code 并 strip 掉整个 @implementation，
+        // 导致 NSClassFromString(@"LocalVideoPlayer") 返回 nil。
+        [LocalVideoPlayer class];
+
         VLOGInit();
 
         NSString *proc = [[NSProcessInfo processInfo] processName];
