@@ -88,7 +88,7 @@ static CGFloat VPMReadScale(void) {
 }
 
 // ============================================================
-//  【内嵌】LocalVideoPlayer
+//  【内嵌】LocalVideoPlayer（★ 解码输出 420v，与原版一致）
 // ============================================================
 @interface LocalVideoPlayer : NSObject
 @property (nonatomic, copy)   NSString *mediaPath;
@@ -200,9 +200,11 @@ static CGFloat VPMReadScale(void) {
     if (!tracks.count) { VLOG(@"无视频轨"); return; }
     AVAssetTrack *track = tracks.firstObject;
 
-    // ★ BGRA 解码（旋转/缩放需要）
+    // ★★★ 关键修复：解码输出 420v，与原版完全一致
+    //   这样视频帧和相机 buffer 都是 YUV，VT 做 YUV→YUV 同格式传输
+    //   完全不涉及 RGB→YUV 转换，永远不会绿屏
     NSDictionary *settings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
     AVAssetReaderTrackOutput *output =
@@ -229,26 +231,27 @@ static CGFloat VPMReadScale(void) {
     if (!img) { if (completion) completion(NO); return; }
 
     size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+
+    // ★ 图片也改成 420v，和相机同格式
     NSDictionary *attrs = @{
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
         (id)kCVPixelBufferMetalCompatibilityKey: @YES,
     };
     CVPixelBufferRef pb = NULL;
-    CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+    CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                         (__bridge CFDictionaryRef)attrs, &pb);
     if (pb) {
-        CVPixelBufferLockBaseAddress(pb, 0);
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        CGContextRef ctx = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(pb), w, h, 8,
-                                                 CVPixelBufferGetBytesPerRow(pb), cs,
-                                                 kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-        if (ctx) {
-            CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
-            CGContextRelease(ctx);
+        // 用 CIImage 渲染到 YUV buffer
+        CIImage *ci = [CIImage imageWithCGImage:img];
+        static CIContext *ciCtx = nil;
+        static dispatch_once_t onceCtx;
+        dispatch_once(&onceCtx, ^{
+            ciCtx = [CIContext contextWithOptions:nil];
+        });
+        if (ciCtx) {
+            [ciCtx render:ci toCVPixelBuffer:pb];
+            [self updateCurrentBuffer:pb];
         }
-        CGColorSpaceRelease(cs);
-        CVPixelBufferUnlockBaseAddress(pb, 0);
-        [self updateCurrentBuffer:pb];
         CVPixelBufferRelease(pb);
     }
     CGImageRelease(img);
@@ -346,8 +349,7 @@ static CGFloat VPMReadScale(void) {
 @end
 
 // ============================================================
-//  ★ VT transfer session
-//  与原版一致：只设 ScalingMode，不设任何色彩属性
+//  VT transfer session（按原版：只设 ScalingMode）
 // ============================================================
 static VTPixelTransferSessionRef gQMTransfer = NULL;
 static NSLock *gQMTransferLock = nil;
@@ -365,10 +367,7 @@ static void QMInitTransfer(void) {
 }
 
 // ============================================================
-//  ★ 核心修复：给源 buffer 加色彩矩阵 attachment（轻量）
-//  用 CVBufferSetAttachment，不用 VTSessionSetProperty
-//  → 不涉及 VT session 内部重建 → 不卡顿
-//  → 明确告诉 VT "用 BT.601 编码到 YUV" → 不绿屏
+//  ★ 核心：YUV → YUV 同格式 transfer（不涉及矩阵）
 // ============================================================
 static int64_t gQMSub = 0, gQMKeep = 0, gQMFail = 0, gQMDis = 0, gQMLast = 0;
 
@@ -377,22 +376,6 @@ static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf)
 
     QMInitTransfer();
     if (!gQMTransfer) return NO;
-
-    // ★★★ 关键修复：给源 buffer 加色彩矩阵 attachment
-    //   iOS 相机 YUV (420v) 的标准组合：
-    //     YCbCrMatrix      = BT.601 (Video Range)
-    //     ColorPrimaries   = BT.709
-    //     TransferFunction = BT.709
-    //   这样 VT 从 BGRA → YUV 时会用 BT.601 编码，和相机完全一致
-    CVBufferSetAttachment(replaceBuf, kCVImageBufferYCbCrMatrixKey,
-                          kCVImageBufferYCbCrMatrix_ITU_R_601_4,
-                          kCVAttachmentMode_ShouldPropagate);
-    CVBufferSetAttachment(replaceBuf, kCVImageBufferColorPrimariesKey,
-                          kCVImageBufferColorPrimaries_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-    CVBufferSetAttachment(replaceBuf, kCVImageBufferTransferFunctionKey,
-                          kCVImageBufferTransferFunction_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
 
     [gQMTransferLock lock];
     OSStatus s = VTPixelTransferSessionTransferImage(gQMTransfer, replaceBuf, cameraBuf);
@@ -427,7 +410,7 @@ static void QMProcessAndModify(CMSampleBufferRef sb, const char *node) {
 }
 
 // ============================================================
-//  Hook：只 BWNodeOutput（视频预览）
+//  Hook：只 BWNodeOutput
 // ============================================================
 static void (*origQMEmit)(id, SEL, CMSampleBufferRef) = NULL;
 
@@ -470,70 +453,63 @@ static void QMInstallHooks(void) {
 }
 
 // ============================================================
-//  旋转/缩放
+//  旋转/缩放（★ 改用 CIImage，支持 YUV）
 // ============================================================
-static uint8_t *gRotSnap = NULL;
-static size_t   gRotSnapCap = 0;
+static CIContext *gQMCIContext = nil;
 
 static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat userScale) {
     if (!buf || (rot == 0 && fabs(userScale - 1.0f) < 0.01f)) return;
+
+    static dispatch_once_t onceCI;
+    dispatch_once(&onceCI, ^{
+        gQMCIContext = [CIContext contextWithOptions:@{
+            kCIContextUseSoftwareRenderer: @NO,
+        }];
+    });
+    if (!gQMCIContext) return;
+
     @try {
         size_t w = CVPixelBufferGetWidth(buf);
         size_t h = CVPixelBufferGetHeight(buf);
         if (w == 0 || h == 0) return;
-        if (CVPixelBufferGetPixelFormatType(buf) != kCVPixelFormatType_32BGRA) return;
-        CVPixelBufferLockBaseAddress(buf, 0);
-        uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(buf);
-        size_t bpr = CVPixelBufferGetBytesPerRow(buf);
-        if (!base || bpr == 0) { CVPixelBufferUnlockBaseAddress(buf, 0); return; }
 
-        size_t need = h * bpr;
-        static dispatch_once_t lockOnce;
-        static id rotLock = nil;
-        dispatch_once(&lockOnce, ^{ rotLock = [NSObject new]; });
-        @synchronized (rotLock) {
-            if (gRotSnapCap < need) {
-                free(gRotSnap);
-                gRotSnap = (uint8_t *)malloc(need);
-                gRotSnapCap = gRotSnap ? need : 0;
-            }
-            if (!gRotSnap) { CVPixelBufferUnlockBaseAddress(buf, 0); return; }
-            memcpy(gRotSnap, base, need);
+        CIImage *src = [CIImage imageWithCVPixelBuffer:buf];
+        if (!src) return;
 
-            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-            CGDataProviderRef prov = CGDataProviderCreateWithData(NULL, gRotSnap, need, NULL);
-            CGImageRef img = CGImageCreate((size_t)w, (size_t)h, 8, 32, bpr, cs,
-                                           kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little,
-                                           prov, NULL, false, kCGRenderingIntentDefault);
-            CGContextRef ctx = CGBitmapContextCreate(base, (size_t)w, (size_t)h, 8, bpr, cs,
-                                                     kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-            if (img && ctx) {
-                CGFloat W = (CGFloat)w, H = (CGFloat)h;
-                CGContextSetRGBFillColor(ctx, 0, 0, 0, 1);
-                CGContextFillRect(ctx, CGRectMake(0, 0, W, H));
+        CGFloat W = (CGFloat)w, H = (CGFloat)h;
 
-                CGContextTranslateCTM(ctx, W / 2.0, H / 2.0);
+        // 1. 中心旋转
+        CGAffineTransform t = CGAffineTransformIdentity;
+        t = CGAffineTransformTranslate(t, W / 2.0, H / 2.0);
+        t = CGAffineTransformRotate(t, -(CGFloat)rot * M_PI / 180.0);
+        t = CGAffineTransformTranslate(t, -W / 2.0, -H / 2.0);
+        CIImage *rotated = [src imageByApplyingTransform:t];
+        if (!rotated) return;
 
-                double rad = (double)rot * M_PI / 180.0;
-                double c = fabs(cos(rad)), s_sin = fabs(sin(rad));
-                CGFloat Wp = W * c + H * s_sin;
-                CGFloat Hp = W * s_sin + H * c;
-                CGFloat fillScale = MAX(Wp / W, Hp / H);
-                CGFloat totalScale = fillScale * userScale;
-                CGFloat dw = W * totalScale;
-                CGFloat dh = H * totalScale;
+        // 2. aspectFill 缩放到原尺寸
+        CGFloat ew = (rot == 90 || rot == 270) ? H : W;
+        CGFloat eh = (rot == 90 || rot == 270) ? W : H;
+        CGRect ext = rotated.extent;
+        CGFloat sx = ew / ext.size.width;
+        CGFloat sy = eh / ext.size.height;
+        CGFloat fillScale = MAX(sx, sy);
+        CGFloat totalScale = fillScale * userScale;
 
-                NSInteger rr = ((rot % 360) + 360) % 360;
-                if (rr) CGContextRotateCTM(ctx, -(CGFloat)rad);
-                CGContextDrawImage(ctx, CGRectMake(-dw / 2.0, -dh / 2.0, dw, dh), img);
-                CGContextFlush(ctx);
-            }
-            if (ctx) CFRelease(ctx);
-            if (img) CFRelease(img);
-            if (prov) CFRelease(prov);
-            CFRelease(cs);
-        }
-        CVPixelBufferUnlockBaseAddress(buf, 0);
+        CGAffineTransform scale = CGAffineTransformMakeScale(totalScale, totalScale);
+        CIImage *scaled = [rotated imageByApplyingTransform:scale];
+
+        // 3. 平移居中
+        CGRect se = scaled.extent;
+        CGAffineTransform trans = CGAffineTransformMakeTranslation(
+            (W - se.size.width) / 2.0 - se.origin.x,
+            (H - se.size.height) / 2.0 - se.origin.y);
+        CIImage *final = [scaled imageByApplyingTransform:trans];
+
+        // 4. 裁剪到原 buffer 尺寸
+        final = [final imageByCroppingToRect:CGRectMake(0, 0, W, H)];
+
+        // 5. 渲染回 YUV buffer
+        [gQMCIContext render:final toCVPixelBuffer:buf];
     } @catch (NSException *e) {}
 }
 
