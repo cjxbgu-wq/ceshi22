@@ -200,9 +200,6 @@ static CGFloat VPMReadScale(void) {
     if (!tracks.count) { VLOG(@"无视频轨"); return; }
     AVAssetTrack *track = tracks.firstObject;
 
-    // ★★★ 关键修复：解码输出 420v，与原版完全一致
-    //   这样视频帧和相机 buffer 都是 YUV，VT 做 YUV→YUV 同格式传输
-    //   完全不涉及 RGB→YUV 转换，永远不会绿屏
     NSDictionary *settings = @{
         (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
@@ -232,7 +229,6 @@ static CGFloat VPMReadScale(void) {
 
     size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
 
-    // ★ 图片也改成 420v，和相机同格式
     NSDictionary *attrs = @{
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
         (id)kCVPixelBufferMetalCompatibilityKey: @YES,
@@ -241,7 +237,6 @@ static CGFloat VPMReadScale(void) {
     CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                         (__bridge CFDictionaryRef)attrs, &pb);
     if (pb) {
-        // 用 CIImage 渲染到 YUV buffer
         CIImage *ci = [CIImage imageWithCGImage:img];
         static CIContext *ciCtx = nil;
         static dispatch_once_t onceCtx;
@@ -349,7 +344,7 @@ static CGFloat VPMReadScale(void) {
 @end
 
 // ============================================================
-//  VT transfer session（按原版：只设 ScalingMode）
+//  VT transfer session
 // ============================================================
 static VTPixelTransferSessionRef gQMTransfer = NULL;
 static NSLock *gQMTransferLock = nil;
@@ -366,14 +361,15 @@ static void QMInitTransfer(void) {
     });
 }
 
+// 独立的格式转换 session（仅当 camFmt != repFmt 时使用）
+static VTPixelTransferSessionRef gQMConvTransfer = NULL;
+static NSLock *gQMConvLock = nil;
+static dispatch_once_t gQMConvOnce;
+
 // ============================================================
-//  ★ 核心：YUV → 同格式 transfer（修复视频/慢动作/延时摄影绿屏）
+//  ★ 核心：同格式 → 主 transfer；异格式 → 先同尺寸转格式再主 transfer
 // ============================================================
 static int64_t gQMSub = 0, gQMKeep = 0, gQMFail = 0, gQMDis = 0, gQMLast = 0;
-
-// 独立的格式转换 session（只用于格式不匹配时的一次性重建）
-static VTPixelTransferSessionRef gQMConvTransfer = NULL;
-static dispatch_once_t gQMConvOnce;
 
 static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf) {
     if (!cameraBuf || !replaceBuf) return NO;
@@ -381,19 +377,29 @@ static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf)
     QMInitTransfer();
     if (!gQMTransfer) return NO;
 
-    // ★★★ 关键修复：检测格式是否一致
-    //   视频/慢动作/延时摄影 模式下相机可能是 420f（FullRange）或 x420（10bit HDR）
-    //   而本地解码/加载的替换帧是 420v。直接把 420v 搬到 420f/x420 上会绿屏。
-    //   对策：格式不一致时，先把替换帧重建为相机格式，再做 transfer。
     OSType camFmt = CVPixelBufferGetPixelFormatType(cameraBuf);
     OSType repFmt = CVPixelBufferGetPixelFormatType(replaceBuf);
 
     CVPixelBufferRef usable = replaceBuf;
 
     if (camFmt != repFmt) {
-        size_t w = CVPixelBufferGetWidth(cameraBuf);
-        size_t h = CVPixelBufferGetHeight(cameraBuf);
+        // ★ 关键：用 replaceBuf 自身的宽高建 conv，保证转换是同尺寸
+        //   - 不使用 cameraBuf 尺寸（避免照片模式 12MP 巨 buffer 卡顿）
+        //   - 同尺寸 + Normal = 无缩放无裁剪，仅做像素格式转换
+        size_t w = CVPixelBufferGetWidth(replaceBuf);
+        size_t h = CVPixelBufferGetHeight(replaceBuf);
         if (w == 0 || h == 0) return NO;
+
+        dispatch_once(&gQMConvOnce, ^{
+            gQMConvLock = [NSLock new];
+            VTPixelTransferSessionCreate(kCFAllocatorDefault, &gQMConvTransfer);
+            if (gQMConvTransfer) {
+                // 同尺寸转换，Normal 即无损
+                VTSessionSetProperty(gQMConvTransfer,
+                    kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Normal);
+            }
+        });
+        if (!gQMConvTransfer || !gQMConvLock) return NO;
 
         NSDictionary *attrs = @{
             (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
@@ -403,27 +409,20 @@ static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf)
         CVReturn cr = CVPixelBufferCreate(kCFAllocatorDefault, w, h, camFmt,
                                           (__bridge CFDictionaryRef)attrs, &conv);
         if (cr == kCVReturnSuccess && conv) {
-            // 用独立 VT session 做纯格式转换
-            dispatch_once(&gQMConvOnce, ^{
-                VTPixelTransferSessionCreate(kCFAllocatorDefault, &gQMConvTransfer);
-            });
-            if (gQMConvTransfer) {
-                OSStatus cs = VTPixelTransferSessionTransferImage(gQMConvTransfer, replaceBuf, conv);
-                if (cs == noErr) {
-                    usable = conv;
-                } else {
-                    VLOG(@"⚠️ 格式转换失败 camFmt=0x%X repFmt=0x%X os=%d", camFmt, repFmt, (int)cs);
-                    CVPixelBufferRelease(conv);
-                    conv = NULL;
-                }
+            // ★ 独立锁：避免 emitSampleBuffer 多线程并发使用同一 session
+            [gQMConvLock lock];
+            OSStatus cs = VTPixelTransferSessionTransferImage(gQMConvTransfer, replaceBuf, conv);
+            [gQMConvLock unlock];
+            if (cs == noErr) {
+                usable = conv;
             } else {
+                VLOG(@"⚠️ 格式转换失败 camFmt=0x%X repFmt=0x%X os=%d", camFmt, repFmt, (int)cs);
                 CVPixelBufferRelease(conv);
                 conv = NULL;
             }
         }
-
-        // 转换失败时，直接保留相机原始帧（宁可透传也不绿屏）
         if (usable == replaceBuf) {
+            // 转换失败：透传相机原帧（宁可不替换，也不绿屏/花屏）
             return NO;
         }
     }
@@ -457,7 +456,6 @@ static void QMProcessAndModify(CMSampleBufferRef sb, const char *node) {
     int64_t total = gQMSub + gQMKeep + gQMFail + gQMDis;
     if (total - gQMLast >= 60) {
         gQMLast = total;
-        // ★ 增补诊断信息：把相机/替换帧的像素格式也打出来，便于排查
         CVImageBufferRef cb = CMSampleBufferGetImageBuffer(sb);
         VLOG(@"📊 [%s] 替换 %lld / 透传 %lld / 失败 %lld / 禁用 %lld | camFmt=0x%X repFmt=0x%X",
              node ?: "?", gQMSub, gQMKeep, gQMFail, gQMDis,
@@ -510,7 +508,7 @@ static void QMInstallHooks(void) {
 }
 
 // ============================================================
-//  旋转/缩放（★ 改用 CIImage，支持 YUV）
+//  旋转/缩放（CIImage）
 // ============================================================
 static CIContext *gQMCIContext = nil;
 
@@ -535,7 +533,6 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat us
 
         CGFloat W = (CGFloat)w, H = (CGFloat)h;
 
-        // 1. 中心旋转
         CGAffineTransform t = CGAffineTransformIdentity;
         t = CGAffineTransformTranslate(t, W / 2.0, H / 2.0);
         t = CGAffineTransformRotate(t, -(CGFloat)rot * M_PI / 180.0);
@@ -543,7 +540,6 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat us
         CIImage *rotated = [src imageByApplyingTransform:t];
         if (!rotated) return;
 
-        // 2. aspectFill 缩放到原尺寸
         CGFloat ew = (rot == 90 || rot == 270) ? H : W;
         CGFloat eh = (rot == 90 || rot == 270) ? W : H;
         CGRect ext = rotated.extent;
@@ -555,17 +551,14 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat us
         CGAffineTransform scale = CGAffineTransformMakeScale(totalScale, totalScale);
         CIImage *scaled = [rotated imageByApplyingTransform:scale];
 
-        // 3. 平移居中
         CGRect se = scaled.extent;
         CGAffineTransform trans = CGAffineTransformMakeTranslation(
             (W - se.size.width) / 2.0 - se.origin.x,
             (H - se.size.height) / 2.0 - se.origin.y);
         CIImage *final = [scaled imageByApplyingTransform:trans];
 
-        // 4. 裁剪到原 buffer 尺寸
         final = [final imageByCroppingToRect:CGRectMake(0, 0, W, H)];
 
-        // 5. 渲染回 YUV buffer
         [gQMCIContext render:final toCVPixelBuffer:buf];
     } @catch (NSException *e) {}
 }
