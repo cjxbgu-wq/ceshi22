@@ -200,6 +200,9 @@ static CGFloat VPMReadScale(void) {
     if (!tracks.count) { VLOG(@"无视频轨"); return; }
     AVAssetTrack *track = tracks.firstObject;
 
+    // ★★★ 关键修复：解码输出 420v，与原版完全一致
+    //   这样视频帧和相机 buffer 都是 YUV，VT 做 YUV→YUV 同格式传输
+    //   完全不涉及 RGB→YUV 转换，永远不会绿屏
     NSDictionary *settings = @{
         (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
@@ -229,6 +232,7 @@ static CGFloat VPMReadScale(void) {
 
     size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
 
+    // ★ 图片也改成 420v，和相机同格式
     NSDictionary *attrs = @{
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
         (id)kCVPixelBufferMetalCompatibilityKey: @YES,
@@ -237,6 +241,7 @@ static CGFloat VPMReadScale(void) {
     CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                         (__bridge CFDictionaryRef)attrs, &pb);
     if (pb) {
+        // 用 CIImage 渲染到 YUV buffer
         CIImage *ci = [CIImage imageWithCGImage:img];
         static CIContext *ciCtx = nil;
         static dispatch_once_t onceCtx;
@@ -344,95 +349,225 @@ static CGFloat VPMReadScale(void) {
 @end
 
 // ============================================================
-//  VT transfer session
+//  VT session（Trim + Normal 双 session，修复视频绿边）
 // ============================================================
-static VTPixelTransferSessionRef gQMTransfer = NULL;
-static NSLock *gQMTransferLock = nil;
+// 绿边根因（参考源码 GPUImageProcessor.m 明文教训）：
+//   VT Trim 模式下 crop offset 非整数（如 720x538 → 1920x1080 垂直 crop 354.7）
+//   → YUV420 边界半像素越界 → 边缘 UV=0 → 绿边。
+//   照片模式裁剪恰好整数（或 YUV→YUV 同格式）所以不绿；
+//   视频模式 420f/私有格式 + 非整数裁剪 → 稳定复现绿边。
+// 修复方案（不碰相机 IOSurface，避免 IOFence 死锁）：
+//   1) 检测非整数裁剪 → 命中则走 2)
+//   2) 在自有 staging（CPU buffer）上 memcpy 中心裁剪到目标比例（偶对齐）
+//   3) 用 Normal 模式做最终 transfer（比例已匹配，无 crop → 无边界重采样）
+// 其余情况（整数裁剪）保持原 Trim 单步逻辑不变。
+// ============================================================
+
+static VTPixelTransferSessionRef gQMTransfer       = NULL;  // Trim: 整数裁剪主路径
+static VTPixelTransferSessionRef gQMTransferNormal = NULL;  // Normal: 预裁剪后等比缩放
+static NSLock *gQMTransferLock       = nil;
+static NSLock *gQMTransferNormalLock = nil;
+
+// 预裁剪 staging 池（自有 CPU buffer，不碰相机 IOSurface，绿边修复核心）
+#define kQMCropStagingMax 4
+typedef struct {
+    size_t w, h;
+    CVPixelBufferRef staging;
+    uint64_t token;
+    CFAbsoluteTime lastUse;
+} QMCropStagingSlot;
+static QMCropStagingSlot gQMCropStaging[kQMCropStagingMax];
 
 static void QMInitTransfer(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        gQMTransferLock = [NSLock new];
+        gQMTransferLock       = [NSLock new];
+        gQMTransferNormalLock = [NSLock new];
         VTPixelTransferSessionCreate(kCFAllocatorDefault, &gQMTransfer);
         if (gQMTransfer) {
             VTSessionSetProperty(gQMTransfer,
                 kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+            VTSessionSetProperty(gQMTransfer, CFSTR("RealTime"), kCFBooleanTrue);
+        }
+        VTPixelTransferSessionCreate(kCFAllocatorDefault, &gQMTransferNormal);
+        if (gQMTransferNormal) {
+            VTSessionSetProperty(gQMTransferNormal,
+                kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Normal);
+            VTSessionSetProperty(gQMTransferNormal, CFSTR("RealTime"), kCFBooleanTrue);
         }
     });
 }
 
-// 独立的格式转换 session（仅当 camFmt != repFmt 时使用）
-static VTPixelTransferSessionRef gQMConvTransfer = NULL;
-static NSLock *gQMConvLock = nil;
-static dispatch_once_t gQMConvOnce;
+// 判断是否双平面 8bit YUV（420f / 420v）—— 预裁剪路径只对这类格式启用
+static BOOL QMIsYUVBiplanar(OSType fmt) {
+    return (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+            fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+}
+
+// Trim 非整数裁剪检测（YES = 需要预裁剪修复）
+// 逻辑：VT Trim 缩放系数 sc = max(dw/sw, dh/sh)，缩放后裁剪总量的一半
+// 若是整数像素，则安全；否则会命中 UV 平面半像素越界 → 绿边。
+static BOOL QMFractionalCrop(CVImageBufferRef src, CVImageBufferRef dst) {
+    size_t sw = CVPixelBufferGetWidth(src),  sh = CVPixelBufferGetHeight(src);
+    size_t dw = CVPixelBufferGetWidth(dst),  dh = CVPixelBufferGetHeight(dst);
+    if (!sw || !sh || !dw || !dh) return NO;
+    double sc = MAX((double)dw / (double)sw, (double)dh / (double)sh);
+    double cropW = (double)sw * sc - (double)dw;
+    double cropH = (double)sh * sc - (double)dh;
+    if (cropW > 0.5) {
+        double off = cropW / 2.0;
+        if (fabs(off - floor(off + 0.5)) > 1e-3) return YES;
+    }
+    if (cropH > 0.5) {
+        double off = cropH / 2.0;
+        if (fabs(off - floor(off + 0.5)) > 1e-3) return YES;
+    }
+    return NO;
+}
+
+// 取/建预裁剪槽：中心裁剪 src 到 dst 的比例（尺寸偶对齐），内容 memcpy 到自有 buffer。
+// 缓存 key = 裁剪后尺寸；同 token 直接复用（同帧多消费者只裁一次）。
+// 返回的 staging buffer 由槽位持有，调用方不需要 release。
+static CVPixelBufferRef QMCropStagingForRatio(CVImageBufferRef src,
+                                              CVImageBufferRef dst,
+                                              uint64_t token) {
+    size_t sw = CVPixelBufferGetWidth(src),  sh = CVPixelBufferGetHeight(src);
+    size_t dw = CVPixelBufferGetWidth(dst),  dh = CVPixelBufferGetHeight(dst);
+    if (!sw || !sh || !dw || !dh) return NULL;
+
+    double r = (double)dw / (double)dh;
+    size_t cw, ch;
+    if ((double)sw / (double)sh > r) { ch = sh; cw = (size_t)((double)sh * r); }
+    else                             { cw = sw; ch = (size_t)((double)sw / r); }
+    cw &= ~(size_t)1; ch &= ~(size_t)1;
+    if (cw < 4 || ch < 4 || cw > sw || ch > sh) return NULL;
+    size_t cx = (((sw - cw) / 2) & ~(size_t)1);
+    size_t cy = (((sh - ch) / 2) & ~(size_t)1);
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    QMCropStagingSlot *slot = NULL;
+    int lruIdx = 0;
+    for (int i = 0; i < kQMCropStagingMax; i++) {
+        if (gQMCropStaging[i].staging &&
+            gQMCropStaging[i].w == cw && gQMCropStaging[i].h == ch) {
+            slot = &gQMCropStaging[i]; break;
+        }
+        if (gQMCropStaging[i].lastUse < gQMCropStaging[lruIdx].lastUse) lruIdx = i;
+    }
+    if (!slot) {
+        int idx = -1;
+        for (int i = 0; i < kQMCropStagingMax; i++) {
+            if (!gQMCropStaging[i].staging) { idx = i; break; }
+        }
+        if (idx < 0) {
+            idx = lruIdx;
+            CVPixelBufferRelease(gQMCropStaging[idx].staging);
+            gQMCropStaging[idx].staging = NULL;
+        }
+        OSType srcFmt = CVPixelBufferGetPixelFormatType(src);
+        CVPixelBufferRef nb = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, cw, ch, srcFmt, NULL, &nb) != noErr || !nb)
+            return NULL;
+        gQMCropStaging[idx].w = cw;
+        gQMCropStaging[idx].h = ch;
+        gQMCropStaging[idx].staging = nb;
+        gQMCropStaging[idx].token = 0;
+        gQMCropStaging[idx].lastUse = now;
+        slot = &gQMCropStaging[idx];
+    }
+    slot->lastUse = now;
+    if (slot->token == token && token != 0) return slot->staging;  // 同帧复用
+
+    // memcpy 逐平面中心裁剪
+    BOOL copied = NO;
+    int planes = (int)CVPixelBufferGetPlaneCount(src);
+    if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess) {
+        if (CVPixelBufferLockBaseAddress(slot->staging, 0) == kCVReturnSuccess) {
+            if (planes >= 2) {
+                // YUV biplanar：Y 平面逐行 cw 字节；UV 平面同样 cw 字节（CbCr 对）
+                uint8_t *sb = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 0);
+                uint8_t *db = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(slot->staging, 0);
+                size_t srb = CVPixelBufferGetBytesPerRowOfPlane(src, 0);
+                size_t drb = CVPixelBufferGetBytesPerRowOfPlane(slot->staging, 0);
+                if (sb && db) {
+                    for (size_t y = 0; y < ch; y++)
+                        memcpy(db + y * drb, sb + (cy + y) * srb + cx, cw);
+                }
+                sb = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 1);
+                db = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(slot->staging, 1);
+                srb = CVPixelBufferGetBytesPerRowOfPlane(src, 1);
+                drb = CVPixelBufferGetBytesPerRowOfPlane(slot->staging, 1);
+                if (sb && db) {
+                    for (size_t y = 0; y < ch / 2; y++)
+                        memcpy(db + y * drb, sb + (cy / 2 + y) * srb + cx, cw);
+                }
+                copied = YES;
+            } else {
+                // BGRA：4 字节/px（图片路径若将来改变格式，仍能正常裁剪）
+                uint8_t *sb = (uint8_t *)CVPixelBufferGetBaseAddress(src);
+                uint8_t *db = (uint8_t *)CVPixelBufferGetBaseAddress(slot->staging);
+                size_t srb = CVPixelBufferGetBytesPerRow(src);
+                size_t drb = CVPixelBufferGetBytesPerRow(slot->staging);
+                if (sb && db) {
+                    size_t rowBytes = cw * 4;
+                    for (size_t y = 0; y < ch; y++)
+                        memcpy(db + y * drb, sb + (cy + y) * srb + cx * 4, rowBytes);
+                }
+                copied = YES;
+            }
+            // 色彩附件同步（range/矩阵等跟随，避免下游 VT 用默认色彩空间）
+            CFDictionaryRef atts = CVBufferCopyAttachments(src, kCVAttachmentMode_ShouldPropagate);
+            if (atts) {
+                CVBufferSetAttachments(slot->staging, atts, kCVAttachmentMode_ShouldPropagate);
+                CFRelease(atts);
+            }
+            CVPixelBufferUnlockBaseAddress(slot->staging, 0);
+        }
+        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    }
+    if (copied) {
+        slot->token = token;
+        return slot->staging;
+    }
+    return NULL;
+}
 
 // ============================================================
-//  ★ 核心：同格式 → 主 transfer；异格式 → 先同尺寸转格式再主 transfer
+//  ★ 核心：替换（Trim 主路径 + 非整数裁剪预裁剪修复）
 // ============================================================
 static int64_t gQMSub = 0, gQMKeep = 0, gQMFail = 0, gQMDis = 0, gQMLast = 0;
+static volatile uint64_t gQMFrameToken = 0;  // 帧代数（staging 复用 key）
 
-static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf) {
+static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf,
+                             uint64_t token) {
     if (!cameraBuf || !replaceBuf) return NO;
-
     QMInitTransfer();
     if (!gQMTransfer) return NO;
 
     OSType camFmt = CVPixelBufferGetPixelFormatType(cameraBuf);
     OSType repFmt = CVPixelBufferGetPixelFormatType(replaceBuf);
 
-    CVPixelBufferRef usable = replaceBuf;
-
-    if (camFmt != repFmt) {
-        // ★ 关键：用 replaceBuf 自身的宽高建 conv，保证转换是同尺寸
-        //   - 不使用 cameraBuf 尺寸（避免照片模式 12MP 巨 buffer 卡顿）
-        //   - 同尺寸 + Normal = 无缩放无裁剪，仅做像素格式转换
-        size_t w = CVPixelBufferGetWidth(replaceBuf);
-        size_t h = CVPixelBufferGetHeight(replaceBuf);
-        if (w == 0 || h == 0) return NO;
-
-        dispatch_once(&gQMConvOnce, ^{
-            gQMConvLock = [NSLock new];
-            VTPixelTransferSessionCreate(kCFAllocatorDefault, &gQMConvTransfer);
-            if (gQMConvTransfer) {
-                // 同尺寸转换，Normal 即无损
-                VTSessionSetProperty(gQMConvTransfer,
-                    kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Normal);
-            }
-        });
-        if (!gQMConvTransfer || !gQMConvLock) return NO;
-
-        NSDictionary *attrs = @{
-            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-            (id)kCVPixelBufferMetalCompatibilityKey: @YES,
-        };
-        CVPixelBufferRef conv = NULL;
-        CVReturn cr = CVPixelBufferCreate(kCFAllocatorDefault, w, h, camFmt,
-                                          (__bridge CFDictionaryRef)attrs, &conv);
-        if (cr == kCVReturnSuccess && conv) {
-            // ★ 独立锁：避免 emitSampleBuffer 多线程并发使用同一 session
-            [gQMConvLock lock];
-            OSStatus cs = VTPixelTransferSessionTransferImage(gQMConvTransfer, replaceBuf, conv);
-            [gQMConvLock unlock];
-            if (cs == noErr) {
-                usable = conv;
-            } else {
-                VLOG(@"⚠️ 格式转换失败 camFmt=0x%X repFmt=0x%X os=%d", camFmt, repFmt, (int)cs);
-                CVPixelBufferRelease(conv);
-                conv = NULL;
-            }
-        }
-        if (usable == replaceBuf) {
-            // 转换失败：透传相机原帧（宁可不替换，也不绿屏/花屏）
-            return NO;
+    // ===== 绿边修复：非整数裁剪 + 双端 YUV → 预裁剪 + Normal 模式 =====
+    // 只对 8bit 双平面 YUV（420f/420v）启用；BGRA 无 UV 子采样，无需修复；
+    // 私有格式不在本路径（交 VT 处理，失败即透传）
+    if (QMFractionalCrop(replaceBuf, cameraBuf) &&
+        QMIsYUVBiplanar(repFmt) && QMIsYUVBiplanar(camFmt)) {
+        CVPixelBufferRef cropped = QMCropStagingForRatio(replaceBuf, cameraBuf, token);
+        if (cropped) {
+            [gQMTransferNormalLock lock];
+            OSStatus s = VTPixelTransferSessionTransferImage(gQMTransferNormal,
+                                                             cropped, cameraBuf);
+            [gQMTransferNormalLock unlock];
+            if (s == noErr) return YES;
+            // Normal 也失败：落到下方 Trim 兜底（可能仍绿边，但至少不花屏）
+            VLOG(@"⚠️ 预裁剪 Normal transfer 失败 os=%d，回落 Trim", (int)s);
         }
     }
 
+    // ===== 常规路径：Trim 单步（照片/正方形/全景/整数裁剪视频） =====
     [gQMTransferLock lock];
-    OSStatus s = VTPixelTransferSessionTransferImage(gQMTransfer, usable, cameraBuf);
+    OSStatus s = VTPixelTransferSessionTransferImage(gQMTransfer, replaceBuf, cameraBuf);
     [gQMTransferLock unlock];
-
-    if (usable != replaceBuf) CVPixelBufferRelease(usable);
-
     return (s == noErr);
 }
 
@@ -448,7 +583,8 @@ static void QMProcessAndModify(CMSampleBufferRef sb, const char *node) {
     CVImageBufferRef cameraBuf = CMSampleBufferGetImageBuffer(sb);
     if (!cameraBuf) { CVPixelBufferRelease(replaceBuf); gQMKeep++; return; }
 
-    BOOL ok = QMReplaceInPlace(cameraBuf, replaceBuf);
+    uint64_t token = __sync_add_and_fetch(&gQMFrameToken, 1);
+    BOOL ok = QMReplaceInPlace(cameraBuf, replaceBuf, token);
     CVPixelBufferRelease(replaceBuf);
 
     if (ok) gQMSub++; else gQMFail++;
@@ -508,7 +644,7 @@ static void QMInstallHooks(void) {
 }
 
 // ============================================================
-//  旋转/缩放（CIImage）
+//  旋转/缩放（★ 改用 CIImage，支持 YUV）
 // ============================================================
 static CIContext *gQMCIContext = nil;
 
@@ -533,6 +669,7 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat us
 
         CGFloat W = (CGFloat)w, H = (CGFloat)h;
 
+        // 1. 中心旋转
         CGAffineTransform t = CGAffineTransformIdentity;
         t = CGAffineTransformTranslate(t, W / 2.0, H / 2.0);
         t = CGAffineTransformRotate(t, -(CGFloat)rot * M_PI / 180.0);
@@ -540,6 +677,7 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat us
         CIImage *rotated = [src imageByApplyingTransform:t];
         if (!rotated) return;
 
+        // 2. aspectFill 缩放到原尺寸
         CGFloat ew = (rot == 90 || rot == 270) ? H : W;
         CGFloat eh = (rot == 90 || rot == 270) ? W : H;
         CGRect ext = rotated.extent;
@@ -551,14 +689,17 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat us
         CGAffineTransform scale = CGAffineTransformMakeScale(totalScale, totalScale);
         CIImage *scaled = [rotated imageByApplyingTransform:scale];
 
+        // 3. 平移居中
         CGRect se = scaled.extent;
         CGAffineTransform trans = CGAffineTransformMakeTranslation(
             (W - se.size.width) / 2.0 - se.origin.x,
             (H - se.size.height) / 2.0 - se.origin.y);
         CIImage *final = [scaled imageByApplyingTransform:trans];
 
+        // 4. 裁剪到原 buffer 尺寸
         final = [final imageByCroppingToRect:CGRectMake(0, 0, W, H)];
 
+        // 5. 渲染回 YUV buffer
         [gQMCIContext render:final toCVPixelBuffer:buf];
     } @catch (NSException *e) {}
 }
