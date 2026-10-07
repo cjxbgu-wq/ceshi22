@@ -367,9 +367,13 @@ static void QMInitTransfer(void) {
 }
 
 // ============================================================
-//  ★ 核心：YUV → YUV 同格式 transfer（不涉及矩阵）
+//  ★ 核心：YUV → 同格式 transfer（修复视频/慢动作/延时摄影绿屏）
 // ============================================================
 static int64_t gQMSub = 0, gQMKeep = 0, gQMFail = 0, gQMDis = 0, gQMLast = 0;
+
+// 独立的格式转换 session（只用于格式不匹配时的一次性重建）
+static VTPixelTransferSessionRef gQMConvTransfer = NULL;
+static dispatch_once_t gQMConvOnce;
 
 static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf) {
     if (!cameraBuf || !replaceBuf) return NO;
@@ -377,9 +381,58 @@ static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf)
     QMInitTransfer();
     if (!gQMTransfer) return NO;
 
+    // ★★★ 关键修复：检测格式是否一致
+    //   视频/慢动作/延时摄影 模式下相机可能是 420f（FullRange）或 x420（10bit HDR）
+    //   而本地解码/加载的替换帧是 420v。直接把 420v 搬到 420f/x420 上会绿屏。
+    //   对策：格式不一致时，先把替换帧重建为相机格式，再做 transfer。
+    OSType camFmt = CVPixelBufferGetPixelFormatType(cameraBuf);
+    OSType repFmt = CVPixelBufferGetPixelFormatType(replaceBuf);
+
+    CVPixelBufferRef usable = replaceBuf;
+
+    if (camFmt != repFmt) {
+        size_t w = CVPixelBufferGetWidth(cameraBuf);
+        size_t h = CVPixelBufferGetHeight(cameraBuf);
+        if (w == 0 || h == 0) return NO;
+
+        NSDictionary *attrs = @{
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            (id)kCVPixelBufferMetalCompatibilityKey: @YES,
+        };
+        CVPixelBufferRef conv = NULL;
+        CVReturn cr = CVPixelBufferCreate(kCFAllocatorDefault, w, h, camFmt,
+                                          (__bridge CFDictionaryRef)attrs, &conv);
+        if (cr == kCVReturnSuccess && conv) {
+            // 用独立 VT session 做纯格式转换
+            dispatch_once(&gQMConvOnce, ^{
+                VTPixelTransferSessionCreate(kCFAllocatorDefault, &gQMConvTransfer);
+            });
+            if (gQMConvTransfer) {
+                OSStatus cs = VTPixelTransferSessionTransferImage(gQMConvTransfer, replaceBuf, conv);
+                if (cs == noErr) {
+                    usable = conv;
+                } else {
+                    VLOG(@"⚠️ 格式转换失败 camFmt=0x%X repFmt=0x%X os=%d", camFmt, repFmt, (int)cs);
+                    CVPixelBufferRelease(conv);
+                    conv = NULL;
+                }
+            } else {
+                CVPixelBufferRelease(conv);
+                conv = NULL;
+            }
+        }
+
+        // 转换失败时，直接保留相机原始帧（宁可透传也不绿屏）
+        if (usable == replaceBuf) {
+            return NO;
+        }
+    }
+
     [gQMTransferLock lock];
-    OSStatus s = VTPixelTransferSessionTransferImage(gQMTransfer, replaceBuf, cameraBuf);
+    OSStatus s = VTPixelTransferSessionTransferImage(gQMTransfer, usable, cameraBuf);
     [gQMTransferLock unlock];
+
+    if (usable != replaceBuf) CVPixelBufferRelease(usable);
 
     return (s == noErr);
 }
@@ -404,8 +457,12 @@ static void QMProcessAndModify(CMSampleBufferRef sb, const char *node) {
     int64_t total = gQMSub + gQMKeep + gQMFail + gQMDis;
     if (total - gQMLast >= 60) {
         gQMLast = total;
-        VLOG(@"📊 [%s] 替换 %lld / 透传 %lld / 失败 %lld / 禁用 %lld",
-             node ?: "?", gQMSub, gQMKeep, gQMFail, gQMDis);
+        // ★ 增补诊断信息：把相机/替换帧的像素格式也打出来，便于排查
+        CVImageBufferRef cb = CMSampleBufferGetImageBuffer(sb);
+        VLOG(@"📊 [%s] 替换 %lld / 透传 %lld / 失败 %lld / 禁用 %lld | camFmt=0x%X repFmt=0x%X",
+             node ?: "?", gQMSub, gQMKeep, gQMFail, gQMDis,
+             cb ? CVPixelBufferGetPixelFormatType(cb) : 0,
+             replaceBuf ? CVPixelBufferGetPixelFormatType(replaceBuf) : 0);
     }
 }
 
