@@ -345,7 +345,8 @@ static CGFloat VPMReadScale(void) {
 @end
 
 // ============================================================
-//  ★ VT transfer session（不硬编码色彩属性）
+//  ★ VT transfer session（一次性设置色彩矩阵，不再每帧设）
+//  iOS 相机 YUV VIDEO RANGE 标准: BT.601 矩阵 + BT.709 原色
 // ============================================================
 static VTPixelTransferSessionRef gQMTransfer = NULL;
 static NSLock *gQMTransferLock = nil;
@@ -358,34 +359,24 @@ static void QMInitTransfer(void) {
         if (gQMTransfer) {
             VTSessionSetProperty(gQMTransfer,
                 kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+            // ★ 一次性设置目标色彩空间为 iOS 相机 VIDEO RANGE 标准
+            //   YCbCrMatrix = BT.601（Video Range 矩阵）
+            //   ColorPrimaries = BT.709（iPhone 屏幕原色）
+            VTSessionSetProperty(gQMTransfer,
+                kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+            VTSessionSetProperty(gQMTransfer,
+                kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                kCVImageBufferColorPrimaries_ITU_R_709_2);
+            VTSessionSetProperty(gQMTransfer,
+                kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                kCVImageBufferTransferFunction_ITU_R_709_2);
         }
     });
 }
 
-// ★ 从相机 buffer 读色彩矩阵（带 NULL + 类型检查，避免清空 session）
-static void QMSyncTransferMatrixFromCamera(CVImageBufferRef cameraBuf) {
-    if (!gQMTransfer || !cameraBuf) return;
-
-    CFTypeRef matrix    = CVBufferGetAttachment(cameraBuf, kCVImageBufferYCbCrMatrixKey, NULL);
-    CFTypeRef primaries = CVBufferGetAttachment(cameraBuf, kCVImageBufferColorPrimariesKey, NULL);
-    CFTypeRef transfer  = CVBufferGetAttachment(cameraBuf, kCVImageBufferTransferFunctionKey, NULL);
-
-    if (matrix && CFGetTypeID(matrix) == CFStringGetTypeID()) {
-        VTSessionSetProperty(gQMTransfer,
-            kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, matrix);
-    }
-    if (primaries && CFGetTypeID(primaries) == CFStringGetTypeID()) {
-        VTSessionSetProperty(gQMTransfer,
-            kVTPixelTransferPropertyKey_DestinationColorPrimaries, primaries);
-    }
-    if (transfer && CFGetTypeID(transfer) == CFStringGetTypeID()) {
-        VTSessionSetProperty(gQMTransfer,
-            kVTPixelTransferPropertyKey_DestinationTransferFunction, transfer);
-    }
-}
-
 // ============================================================
-//  核心：就地替换
+//  核心：就地替换（一行 transfer，不设任何东西）
 // ============================================================
 static int64_t gQMSub = 0, gQMKeep = 0, gQMFail = 0, gQMDis = 0, gQMLast = 0;
 
@@ -396,7 +387,6 @@ static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf)
     if (!gQMTransfer) return NO;
 
     [gQMTransferLock lock];
-    QMSyncTransferMatrixFromCamera(cameraBuf);
     OSStatus s = VTPixelTransferSessionTransferImage(gQMTransfer, replaceBuf, cameraBuf);
     [gQMTransferLock unlock];
 
@@ -429,7 +419,8 @@ static void QMProcessAndModify(CMSampleBufferRef sb, const char *node) {
 }
 
 // ============================================================
-//  Hook 节点 1：BWNodeOutput
+//  Hook：只 BWNodeOutput（视频预览）
+//  照片管线 (BWStillImageScalerNode / BWPhotoEncoderNode) 不 hook
 // ============================================================
 static void (*origQMEmit)(id, SEL, CMSampleBufferRef) = NULL;
 
@@ -442,40 +433,10 @@ static void QMEmitHook(id self, SEL _cmd, CMSampleBufferRef sb) {
     if (origQMEmit) origQMEmit(self, _cmd, sb);
 }
 
-// ============================================================
-//  Hook 节点 2/3（★ 各自独立保存 orig）
-// ============================================================
-static void (*origQMRender2)(id, SEL, CMSampleBufferRef, id) = NULL;
-static void (*origQMRender3)(id, SEL, CMSampleBufferRef, id) = NULL;
-
-static void QMRenderHook2(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
-    @try {
-        QMProcessAndModify(sb, "render2");
-    } @catch (NSException *e) {
-        VLOG(@"render2 异常: %@", e);
-    }
-    if (origQMRender2) origQMRender2(self, _cmd, sb, input);
-}
-
-static void QMRenderHook3(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
-    @try {
-        QMProcessAndModify(sb, "render3");
-    } @catch (NSException *e) {
-        VLOG(@"render3 异常: %@", e);
-    }
-    if (origQMRender3) origQMRender3(self, _cmd, sb, input);
-}
-
-// ============================================================
-//  ★ 安装 hook：只 3 个显式节点，不做动态扫描
-// ============================================================
 static BOOL gQMEmitInstalled = NO;
-static BOOL gQMScalInstalled = NO;
-static BOOL gQMEncInstalled = NO;
 
 static void QMInstallHooks(void) {
     @try {
-        // 节点 1：BWNodeOutput
         if (!gQMEmitInstalled) {
             Class c = NSClassFromString(@"BWNodeOutput");
             if (c) {
@@ -492,46 +453,6 @@ static void QMInstallHooks(void) {
             }
         }
 
-        // 节点 2：BWStillImageScalerNode
-        if (!gQMScalInstalled) {
-            Class c = NSClassFromString(@"BWStillImageScalerNode");
-            if (c) {
-                Method m = class_getInstanceMethod(c, @selector(renderSampleBuffer:forInput:));
-                if (m) {
-                    IMP cur = method_getImplementation(m);
-                    if (cur != (IMP)QMRenderHook2) {
-                        origQMRender2 = (void (*)(id, SEL, CMSampleBufferRef, id))cur;
-                        method_setImplementation(m, (IMP)QMRenderHook2);
-                    }
-                    gQMScalInstalled = YES;
-                    VLOG(@"✅ BWStillImageScalerNode 已钩");
-                }
-            } else {
-                gQMScalInstalled = YES;
-                VLOG(@"⚠️ BWStillImageScalerNode 不存在");
-            }
-        }
-
-        // 节点 3：BWPhotoEncoderNode
-        if (!gQMEncInstalled) {
-            Class c = NSClassFromString(@"BWPhotoEncoderNode");
-            if (c) {
-                Method m = class_getInstanceMethod(c, @selector(renderSampleBuffer:forInput:));
-                if (m) {
-                    IMP cur = method_getImplementation(m);
-                    if (cur != (IMP)QMRenderHook3) {
-                        origQMRender3 = (void (*)(id, SEL, CMSampleBufferRef, id))cur;
-                        method_setImplementation(m, (IMP)QMRenderHook3);
-                    }
-                    gQMEncInstalled = YES;
-                    VLOG(@"✅ BWPhotoEncoderNode 已钩");
-                }
-            } else {
-                gQMEncInstalled = YES;
-                VLOG(@"⚠️ BWPhotoEncoderNode 不存在");
-            }
-        }
-
         if (!gQMEmitInstalled) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
@@ -542,7 +463,7 @@ static void QMInstallHooks(void) {
 }
 
 // ============================================================
-//  旋转/缩放（去掉 Y 翻转，修 180）
+//  旋转/缩放
 // ============================================================
 static uint8_t *gRotSnap = NULL;
 static size_t   gRotSnapCap = 0;
@@ -584,7 +505,6 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat us
                 CGContextSetRGBFillColor(ctx, 0, 0, 0, 1);
                 CGContextFillRect(ctx, CGRectMake(0, 0, W, H));
 
-                // 去掉 Y 翻转
                 CGContextTranslateCTM(ctx, W / 2.0, H / 2.0);
 
                 double rad = (double)rot * M_PI / 180.0;
@@ -813,7 +733,7 @@ static void VPMScheduleBootstrap(int attempt) {
 %end
 
 // ============================================================
-//  %ctor：只在 mediaserverd 跑引擎
+//  %ctor
 // ============================================================
 %ctor {
     @autoreleasepool {
