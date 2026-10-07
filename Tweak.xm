@@ -200,6 +200,7 @@ static CGFloat VPMReadScale(void) {
     if (!tracks.count) { VLOG(@"无视频轨"); return; }
     AVAssetTrack *track = tracks.firstObject;
 
+    // ★ BGRA 解码（旋转/缩放需要）
     NSDictionary *settings = @{
         (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
@@ -345,8 +346,8 @@ static CGFloat VPMReadScale(void) {
 @end
 
 // ============================================================
-//  ★ VT transfer session（一次性设置色彩矩阵，不再每帧设）
-//  iOS 相机 YUV VIDEO RANGE 标准: BT.601 矩阵 + BT.709 原色
+//  ★ VT transfer session
+//  与原版一致：只设 ScalingMode，不设任何色彩属性
 // ============================================================
 static VTPixelTransferSessionRef gQMTransfer = NULL;
 static NSLock *gQMTransferLock = nil;
@@ -359,24 +360,15 @@ static void QMInitTransfer(void) {
         if (gQMTransfer) {
             VTSessionSetProperty(gQMTransfer,
                 kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
-            // ★ 一次性设置目标色彩空间为 iOS 相机 VIDEO RANGE 标准
-            //   YCbCrMatrix = BT.601（Video Range 矩阵）
-            //   ColorPrimaries = BT.709（iPhone 屏幕原色）
-            VTSessionSetProperty(gQMTransfer,
-                kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
-                kCVImageBufferYCbCrMatrix_ITU_R_601_4);
-            VTSessionSetProperty(gQMTransfer,
-                kVTPixelTransferPropertyKey_DestinationColorPrimaries,
-                kCVImageBufferColorPrimaries_ITU_R_709_2);
-            VTSessionSetProperty(gQMTransfer,
-                kVTPixelTransferPropertyKey_DestinationTransferFunction,
-                kCVImageBufferTransferFunction_ITU_R_709_2);
         }
     });
 }
 
 // ============================================================
-//  核心：就地替换（一行 transfer，不设任何东西）
+//  ★ 核心修复：给源 buffer 加色彩矩阵 attachment（轻量）
+//  用 CVBufferSetAttachment，不用 VTSessionSetProperty
+//  → 不涉及 VT session 内部重建 → 不卡顿
+//  → 明确告诉 VT "用 BT.601 编码到 YUV" → 不绿屏
 // ============================================================
 static int64_t gQMSub = 0, gQMKeep = 0, gQMFail = 0, gQMDis = 0, gQMLast = 0;
 
@@ -385,6 +377,22 @@ static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf)
 
     QMInitTransfer();
     if (!gQMTransfer) return NO;
+
+    // ★★★ 关键修复：给源 buffer 加色彩矩阵 attachment
+    //   iOS 相机 YUV (420v) 的标准组合：
+    //     YCbCrMatrix      = BT.601 (Video Range)
+    //     ColorPrimaries   = BT.709
+    //     TransferFunction = BT.709
+    //   这样 VT 从 BGRA → YUV 时会用 BT.601 编码，和相机完全一致
+    CVBufferSetAttachment(replaceBuf, kCVImageBufferYCbCrMatrixKey,
+                          kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+                          kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(replaceBuf, kCVImageBufferColorPrimariesKey,
+                          kCVImageBufferColorPrimaries_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(replaceBuf, kCVImageBufferTransferFunctionKey,
+                          kCVImageBufferTransferFunction_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldPropagate);
 
     [gQMTransferLock lock];
     OSStatus s = VTPixelTransferSessionTransferImage(gQMTransfer, replaceBuf, cameraBuf);
@@ -420,7 +428,6 @@ static void QMProcessAndModify(CMSampleBufferRef sb, const char *node) {
 
 // ============================================================
 //  Hook：只 BWNodeOutput（视频预览）
-//  照片管线 (BWStillImageScalerNode / BWPhotoEncoderNode) 不 hook
 // ============================================================
 static void (*origQMEmit)(id, SEL, CMSampleBufferRef) = NULL;
 
