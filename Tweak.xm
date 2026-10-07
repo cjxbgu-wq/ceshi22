@@ -236,17 +236,6 @@ static CGFloat VPMReadScale(void) {
     CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
                         (__bridge CFDictionaryRef)attrs, &pb);
     if (pb) {
-        // 图片 buffer 设置色彩空间
-        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
-                              kCVImageBufferColorPrimaries_ITU_R_709_2,
-                              kCVAttachmentMode_ShouldPropagate);
-        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
-                              kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-                              kCVAttachmentMode_ShouldPropagate);
-        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
-                              kCVImageBufferTransferFunction_ITU_R_709_2,
-                              kCVAttachmentMode_ShouldPropagate);
-
         CVPixelBufferLockBaseAddress(pb, 0);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGContextRef ctx = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(pb), w, h, 8,
@@ -291,7 +280,6 @@ static CGFloat VPMReadScale(void) {
                     continue;
                 }
 
-                // wallclock 对齐视频 PTS（保证播放速度正确）
                 CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
                 double t = CMTimeGetSeconds(pts);
                 if (ss.videoStartPTS < 0) ss.videoStartPTS = t;
@@ -357,7 +345,7 @@ static CGFloat VPMReadScale(void) {
 @end
 
 // ============================================================
-//  ★ VT transfer session（★ 修复 1：不硬编码色彩属性）
+//  ★ VT transfer session（不硬编码色彩属性）
 // ============================================================
 static VTPixelTransferSessionRef gQMTransfer = NULL;
 static NSLock *gQMTransferLock = nil;
@@ -370,12 +358,11 @@ static void QMInitTransfer(void) {
         if (gQMTransfer) {
             VTSessionSetProperty(gQMTransfer,
                 kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
-            // ★ 不设置任何色彩属性，让 VT 从 buffer attachments 推断
         }
     });
 }
 
-// ★★★ 修复 1：每次 transfer 前从相机 buffer 读色彩矩阵
+// ★ 从相机 buffer 读色彩矩阵（带 NULL + 类型检查，避免清空 session）
 static void QMSyncTransferMatrixFromCamera(CVImageBufferRef cameraBuf) {
     if (!gQMTransfer || !cameraBuf) return;
 
@@ -383,22 +370,22 @@ static void QMSyncTransferMatrixFromCamera(CVImageBufferRef cameraBuf) {
     CFTypeRef primaries = CVBufferGetAttachment(cameraBuf, kCVImageBufferColorPrimariesKey, NULL);
     CFTypeRef transfer  = CVBufferGetAttachment(cameraBuf, kCVImageBufferTransferFunctionKey, NULL);
 
-    if (matrix) {
+    if (matrix && CFGetTypeID(matrix) == CFStringGetTypeID()) {
         VTSessionSetProperty(gQMTransfer,
             kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, matrix);
     }
-    if (primaries) {
+    if (primaries && CFGetTypeID(primaries) == CFStringGetTypeID()) {
         VTSessionSetProperty(gQMTransfer,
             kVTPixelTransferPropertyKey_DestinationColorPrimaries, primaries);
     }
-    if (transfer) {
+    if (transfer && CFGetTypeID(transfer) == CFStringGetTypeID()) {
         VTSessionSetProperty(gQMTransfer,
             kVTPixelTransferPropertyKey_DestinationTransferFunction, transfer);
     }
 }
 
 // ============================================================
-//  ★ 核心：就地替换（★ 修复 1：同步矩阵）
+//  核心：就地替换
 // ============================================================
 static int64_t gQMSub = 0, gQMKeep = 0, gQMFail = 0, gQMDis = 0, gQMLast = 0;
 
@@ -409,7 +396,7 @@ static BOOL QMReplaceInPlace(CVImageBufferRef cameraBuf, CVBufferRef replaceBuf)
     if (!gQMTransfer) return NO;
 
     [gQMTransferLock lock];
-    QMSyncTransferMatrixFromCamera(cameraBuf);   // ★ 每次同步
+    QMSyncTransferMatrixFromCamera(cameraBuf);
     OSStatus s = VTPixelTransferSessionTransferImage(gQMTransfer, replaceBuf, cameraBuf);
     [gQMTransferLock unlock];
 
@@ -456,7 +443,7 @@ static void QMEmitHook(id self, SEL _cmd, CMSampleBufferRef sb) {
 }
 
 // ============================================================
-//  Hook 节点 2/3
+//  Hook 节点 2/3（★ 各自独立保存 orig）
 // ============================================================
 static void (*origQMRender2)(id, SEL, CMSampleBufferRef, id) = NULL;
 static void (*origQMRender3)(id, SEL, CMSampleBufferRef, id) = NULL;
@@ -480,39 +467,7 @@ static void QMRenderHook3(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
 }
 
 // ============================================================
-//  ★ 修复 4：动态扫描所有 BW* 类
-// ============================================================
-static void QMDynamicHookAllBWRenderNodes(void) {
-    int numClasses = objc_getClassList(NULL, 0);
-    if (numClasses <= 0) return;
-    Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
-    if (!classes) return;
-    numClasses = objc_getClassList(classes, numClasses);
-
-    int hooked = 0;
-    for (int i = 0; i < numClasses; i++) {
-        const char *name = class_getName(classes[i]);
-        if (!name || strncmp(name, "BW", 2) != 0) continue;
-
-        Method m = class_getInstanceMethod(classes[i], @selector(renderSampleBuffer:forInput:));
-        if (!m) continue;
-
-        IMP cur = method_getImplementation(m);
-        if (cur == (IMP)QMRenderHook2 || cur == (IMP)QMRenderHook3) continue;
-
-        if (!origQMRender2) {
-            origQMRender2 = (void (*)(id, SEL, CMSampleBufferRef, id))cur;
-        }
-        method_setImplementation(m, (IMP)QMRenderHook2);
-        hooked++;
-        VLOG(@"✅ 动态钩 %s", name);
-    }
-    free(classes);
-    VLOG(@"🔍 动态扫描完成：%d 个 BW* 节点被钩", hooked);
-}
-
-// ============================================================
-//  ★ 修复 5：安装 hook（显式 + 动态）
+//  ★ 安装 hook：只 3 个显式节点，不做动态扫描
 // ============================================================
 static BOOL gQMEmitInstalled = NO;
 static BOOL gQMScalInstalled = NO;
@@ -545,7 +500,7 @@ static void QMInstallHooks(void) {
                 if (m) {
                     IMP cur = method_getImplementation(m);
                     if (cur != (IMP)QMRenderHook2) {
-                        if (!origQMRender2) origQMRender2 = (void (*)(id, SEL, CMSampleBufferRef, id))cur;
+                        origQMRender2 = (void (*)(id, SEL, CMSampleBufferRef, id))cur;
                         method_setImplementation(m, (IMP)QMRenderHook2);
                     }
                     gQMScalInstalled = YES;
@@ -565,7 +520,7 @@ static void QMInstallHooks(void) {
                 if (m) {
                     IMP cur = method_getImplementation(m);
                     if (cur != (IMP)QMRenderHook3) {
-                        if (!origQMRender3) origQMRender3 = (void (*)(id, SEL, CMSampleBufferRef, id))cur;
+                        origQMRender3 = (void (*)(id, SEL, CMSampleBufferRef, id))cur;
                         method_setImplementation(m, (IMP)QMRenderHook3);
                     }
                     gQMEncInstalled = YES;
@@ -575,13 +530,6 @@ static void QMInstallHooks(void) {
                 gQMEncInstalled = YES;
                 VLOG(@"⚠️ BWPhotoEncoderNode 不存在");
             }
-        }
-
-        // ★ 动态扫描所有 BW* 类
-        static BOOL gQMDynamicDone = NO;
-        if (!gQMDynamicDone) {
-            QMDynamicHookAllBWRenderNodes();
-            gQMDynamicDone = YES;
         }
 
         if (!gQMEmitInstalled) {
@@ -594,7 +542,7 @@ static void QMInstallHooks(void) {
 }
 
 // ============================================================
-//  ★ 修复 2：旋转/缩放（去掉 Y 翻转，修 180）
+//  旋转/缩放（去掉 Y 翻转，修 180）
 // ============================================================
 static uint8_t *gRotSnap = NULL;
 static size_t   gRotSnapCap = 0;
@@ -636,12 +584,9 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat us
                 CGContextSetRGBFillColor(ctx, 0, 0, 0, 1);
                 CGContextFillRect(ctx, CGRectMake(0, 0, W, H));
 
-                // ★★★ 修复 2：去掉 Y 翻转
-                // CGImage 在 CGContext 里的绘制原点本身就是左下，
-                // 之前的 translate(0, h) + scale(1, -1) 叠加旋转导致 180 变成镜像。
+                // 去掉 Y 翻转
                 CGContextTranslateCTM(ctx, W / 2.0, H / 2.0);
 
-                // 计算旋转后画布尺寸 + aspectFill 比例
                 double rad = (double)rot * M_PI / 180.0;
                 double c = fabs(cos(rad)), s_sin = fabs(sin(rad));
                 CGFloat Wp = W * c + H * s_sin;
