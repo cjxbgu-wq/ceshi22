@@ -1,10 +1,8 @@
-name: Build Patched Tweak
+name: Build VCamPlus
 
 on:
   push:
     branches: [ main, master ]
-    tags: [ 'v*' ]
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -17,35 +15,27 @@ jobs:
         with:
           python-version: '3.11'
 
-      # -------- ① 安装 ldid（Theos 签名依赖）--------
       - name: 安装 ldid
         run: |
-          brew install ldid
-          which ldid
-          ldid --version || true
+          brew install ldid || true
 
-      # -------- ② 打补丁 + 校验 --------
-      - name: 应用补丁 + 校验
+      - name: 打补丁 + 校验
         run: bash scripts/entry.sh
 
-      # -------- ③ 安装 Theos --------
       - name: 安装 Theos
         run: |
           git clone --recursive --depth 1 https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           echo "$HOME/theos/bin" >> $GITHUB_PATH
-          ls -la $HOME/theos/bin || true
 
-      # -------- ④ 构建 deb --------
       - name: 构建 deb
         run: make package FINALPACKAGE=1
         env:
           THEOS: ${{ env.THEOS }}
 
-      # -------- ⑤ 上传产物 --------
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: vcam-tweak-deb
+          name: VCamPlus-deb
           path: packages/*.deb
           if-no-files-found: error
