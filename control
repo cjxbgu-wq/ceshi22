@@ -1,8 +1,8 @@
 Package: com.example.vcamplus
 Name: VCamPlus
-Version: 1.0.0
+Version: 7.0.0
 Architecture: iphoneos-arm
-Description: Virtual camera tweak (patch-based build)
+Description: Virtual Camera v7.0 (patched build)
 Maintainer: Your Name
 Author: Your Name
 Section: Tweaks
