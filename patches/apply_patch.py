@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-VCamPlus v7.0 补丁脚本（v6 完整修复版）
-========================================
+VCamPlus v7.0 补丁脚本（v7 最终版）
+====================================
 修复清单：
   A. SecTrustCopyCertificateChain iOS 14 编译兼容
   B. _gDID() 所有进程返回真实 UDID（掉激活根因）
@@ -10,8 +10,9 @@ VCamPlus v7.0 补丁脚本（v6 完整修复版）
   D. UI 精简 + 镜像按钮 tag=10
   E. 防重复弹层
   F. FWCtrl ivar 补齐 + updateHighlight 空实现
-  H. VCAM_FRIEND_JS extern 加 extern "C" 前缀
-     ★ v6 修正：用 extern "C" 前缀，不用块语法（避免 "expected unqualified-id"）
+
+注：VCAM_FRIEND_JS_* 由 vcam_friend_js.mm 提供实现（不带 extern "C"），
+    两边都用 C++ linkage，符号自然匹配。
 """
 
 import os
@@ -48,7 +49,7 @@ src = TWEAK.read_text(encoding="utf-8")
 
 # ---------- 幂等 ----------
 if ("PATCH-A]" in src and "PATCH-B]" in src and "PATCH-C]" in src
-        and "PATCH-F]" in src and "PATCH-H]" in src and "tag:10" in src):
+        and "PATCH-F]" in src and "tag:10" in src):
     print("[*] 已打过补丁，跳过（幂等）")
     sys.exit(0)
 
@@ -321,70 +322,6 @@ if "- (void)updateHighlight {" not in src:
             anchor + "\n/* [PATCH-F] updateHighlight 空实现 */\n- (void)updateHighlight { }\n",
             1)
         report.append("✓ [F] updateHighlight 空实现")
-
-# =================================================================
-# H. VCAM_FRIEND_JS_* extern 加 extern "C" 前缀
-#    ★ 关键：extern "C" { } 块语法不能放在函数体内 → 用前缀
-# =================================================================
-OLD_EXTERN = """        extern NSString *VCAM_FRIEND_JS_STREAM_GET(void);
-        extern NSString *VCAM_FRIEND_JS_VIDEO_GET(void);
-        extern NSString *VCAM_FRIEND_JS_IMAGE_GET(void);"""
-
-NEW_EXTERN = """        /* [PATCH-H] extern "C" 前缀：匹配 vcam_friend_js.mm 的 C 符号 */
-#ifdef __cplusplus
-        extern "C" NSString *VCAM_FRIEND_JS_STREAM_GET(void);
-        extern "C" NSString *VCAM_FRIEND_JS_VIDEO_GET(void);
-        extern "C" NSString *VCAM_FRIEND_JS_IMAGE_GET(void);
-#else
-        extern NSString *VCAM_FRIEND_JS_STREAM_GET(void);
-        extern NSString *VCAM_FRIEND_JS_VIDEO_GET(void);
-        extern NSString *VCAM_FRIEND_JS_IMAGE_GET(void);
-#endif"""
-
-if OLD_EXTERN in src:
-    src = src.replace(OLD_EXTERN, NEW_EXTERN, 1)
-    report.append('✓ [H] VCAM_FRIEND_JS extern 加 extern "C" 前缀')
-else:
-    # 行级兜底
-    lines_h = src.split("\n")
-    idx = None
-    for i, l in enumerate(lines_h):
-        if "extern NSString *VCAM_FRIEND_JS_STREAM_GET" in l:
-            idx = i
-            break
-    if idx is not None and idx + 2 < len(lines_h):
-        if ("VCAM_FRIEND_JS_VIDEO_GET" in lines_h[idx + 1]
-                and "VCAM_FRIEND_JS_IMAGE_GET" in lines_h[idx + 2]):
-            indent = lines_h[idx][:len(lines_h[idx]) - len(lines_h[idx].lstrip())]
-            block = [
-                indent + '/* [PATCH-H] extern "C" 前缀 */',
-                '#ifdef __cplusplus',
-                indent + 'extern "C" NSString *VCAM_FRIEND_JS_STREAM_GET(void);',
-                indent + 'extern "C" NSString *VCAM_FRIEND_JS_VIDEO_GET(void);',
-                indent + 'extern "C" NSString *VCAM_FRIEND_JS_IMAGE_GET(void);',
-                '#else',
-                lines_h[idx],
-                lines_h[idx + 1],
-                lines_h[idx + 2],
-                '#endif',
-            ]
-            lines_h = lines_h[:idx] + block + lines_h[idx + 3:]
-            src = "\n".join(lines_h)
-            report.append('✓ [H] VCAM_FRIEND_JS extern 加 extern "C" 前缀（行级兜底）')
-        else:
-            print("[!] VCAM_FRIEND_JS extern 块结构不符", file=sys.stderr)
-    else:
-        print("[!] VCAM_FRIEND_JS extern 行未找到", file=sys.stderr)
-
-# 兜底标记
-if "PATCH-H]" not in src:
-    anchor = "static NSString *vcam_buildWebCamJS(void) {"
-    if anchor in src:
-        src = src.replace(
-            anchor,
-            "/* [PATCH-H] VCAM_FRIEND_JS extern C 标记（兜底） */\n" + anchor,
-            1)
-        report.append("✓ [H] 兜底标记已插入")
 
 # =================================================================
 # 写回
