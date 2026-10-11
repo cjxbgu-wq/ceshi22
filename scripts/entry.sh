@@ -52,17 +52,20 @@ VCAM_TWEAK_PATH="$TARGET" python3 - <<'PY'
 import os, sys
 p = os.environ["VCAM_TWEAK_PATH"]
 src = open(p, encoding="utf-8").read()
+# ★ 修正：只用 "PATCH-X]" 前缀匹配，不依赖后面的具体文字
 checks = [
-    ("PATCH-A] SecTrust",      "SecTrust 兼容未注入"),
-    ("PATCH-B] _gDID",         "_gDID 修复未注入"),
-    ("PATCH-C] _chkInteg",     "_chkInteg 禁用未注入"),
-    ("tag:10",                 "镜像按钮未注入"),
+    ("PATCH-A]",  "SecTrust 兼容未注入"),
+    ("PATCH-B]",  "_gDID 修复未注入"),
+    ("PATCH-C]",  "_chkInteg 禁用未注入"),
+    ("tag:10",    "镜像按钮未注入"),
 ]
 fail = False
 for needle, msg in checks:
     if needle not in src:
-        print(f"[!] {msg}：缺少 `{needle}`", file=sys.stderr); fail = True
-if fail: sys.exit(1)
+        print(f"[!] {msg}：缺少 `{needle}`", file=sys.stderr)
+        fail = True
+if fail:
+    sys.exit(1)
 print("[+] Python 校验通过")
 PY
 
