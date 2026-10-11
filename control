@@ -1,9 +1,0 @@
-Package: com.yourname.qianmianenhancer
-Name: QianmianEnhancer
-Version: 1.0.0
-Architecture: iphoneos-arm
-Description: VCam 增强 Tweak - 悬浮球 + 多槽位 + 图片视频替换
-Maintainer: yourname
-Author: yourname
-Section: Tweaks
-Depends: mobilesubstrate
