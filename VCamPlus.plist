@@ -6,18 +6,6 @@
     <dict>
         <key>Mode</key>
         <string>Any</string>
-        <key>Bundles</key>
-        <array>
-            <string>com.apple.springboard</string>
-            <string>com.apple.WebKit.WebContent</string>
-            <string>com.apple.mobilesafari</string>
-        </array>
-        <key>Executables</key>
-        <array>
-            <string>mediaserverd</string>
-            <string>SpringBoard</string>
-            <string>WebContent</string>
-        </array>
     </dict>
 </dict>
 </plist>
