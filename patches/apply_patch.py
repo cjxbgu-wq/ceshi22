@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VCam Tweak 补丁脚本 v3（深度审计修复版）
-=======================================
-修复清单（11 项）：
-  1. 品牌处理 3 处（含编码通知名 com.vcamplus.* → com.system.*）
-  2. 浏览器注入时机 0 → 1
-  3. UI 精简（正则 + 行级回退双保险）
-  4. 镜像按钮 tag=10
-  5. 【编译修复】FWCtrl ivar 补齐
-  6. 【编译修复】updateHighlight 空实现
-  7. 【链接修复】VCAM_FRIEND_JS_* weak 桩
-  8. 【数据】flock 保护的一次性迁移
-  9. 幂等性
- 10. UI 失败时给出明确锚点
- 11. 多文件定位交由 entry.sh 处理
+VCam Tweak 补丁脚本 v6（全量去品牌 + 编译修复）
+================================================
+改动清单（12 项）：
+   1. 全量去品牌：vcamplus → cfgdatax（明文 + 编码 + URL，等长 8→8）
+   2. 数据迁移：vcamplus → cfgdatax（flock 保护，旧名走 _ds 加密）
+   3. 浏览器 injectionTime 0 → 1
+   4. UI 精简（正则 + 行级回退）
+   5. 镜像按钮 tag=10
+   6. 【编译修复】FWCtrl ivar 补齐
+   7. 【编译修复】updateHighlight + hide 空实现
+   8. 【链接修复】VCAM_FRIEND_JS_* weak 桩
+   9. 防重复弹层
+  10. tag:8 标题刷新
+  11. 【编译修复】SecTrustCopyCertificateChain iOS 14 兼容
+  12. 编译前删除 .patched，防止缓存
 """
 
-import os, re, sys
+import os
+import re
+import sys
 from pathlib import Path
+
 
 # -----------------------------------------------------------------
 # 定位 Tweak.xm
@@ -27,25 +31,28 @@ def locate_tweak() -> Path:
     env = os.environ.get("VCAM_TWEAK_PATH")
     if env:
         p = Path(env)
-        if not p.is_absolute(): p = Path.cwd() / p
-        if p.exists(): return p
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        if p.exists():
+            return p
         print(f"[!] VCAM_TWEAK_PATH 不存在：{p}", file=sys.stderr)
 
     root = Path(__file__).resolve().parent.parent
     for c in [
         root / "Tweak.xm", root / "tweak.xm",
         root / "src" / "Tweak.xm", root / "tweak" / "Tweak.xm",
-        root / "Tweak" / "Tweak.xm", root / "VCamPlus" / "Tweak.xm",
-        root / "vcam" / "Tweak.xm", root / "vcamplus" / "Tweak.xm",
-        root / "Sources" / "Tweak.xm",
+        root / "Tweak" / "Tweak.xm",
     ]:
-        if c.exists(): return c
+        if c.exists():
+            return c
 
-    for p in sorted(root.rglob("Tweak.xm")):
+    for p in sorted(root.rglob("*.xm")):
         s = str(p)
         if any(x in s for x in ("/.git/", "/.theos/", "/packages/", "/obj/")):
             continue
-        return p
+        if "tweak" in p.name.lower():
+            return p
+
     print("[!] 未找到 Tweak.xm", file=sys.stderr)
     sys.exit(1)
 
@@ -55,44 +62,21 @@ print(f"[*] 目标源码：{TWEAK}")
 
 src = TWEAK.read_text(encoding="utf-8")
 
-# ---------- 幂等 ----------
-if "Library/.cfgdata" in src and "tag:10" in src and "_panelVisible;" in src \
-        and "VCAM_FRIEND_JS_STREAM_GET(void) { return" in src:
-    print("[*] 已打过补丁，跳过")
+# ---------- 幂等（v6 特征） ----------
+if ("cfgdatax" in src
+        and "tag:10" in src
+        and "_panelVisible;" in src
+        and "VCAM_FRIEND_JS_STREAM_GET(void) { return" in src
+        and "if (@available(iOS 15.0, *))" in src
+        and "+ (void)hide { }" in src):
+    print("[*] 已打过 v6 补丁，跳过（幂等）")
     sys.exit(0)
 
-original, report = src, []
+original = src
+report = []
 
 # =================================================================
-# 1. 品牌处理（3 处）
-# =================================================================
-# 1a. 目录
-src = src.replace(
-    '#define VCAM_DIR   @"/var/jb/var/mobile/Library/vcamplus"',
-    '#define VCAM_DIR   @"/var/jb/var/mobile/Library/.cfgdata"',
-)
-if "Library/.cfgdata" in src: report.append("✓ 目录 → .cfgdata")
-
-# 1b. 明文 formatIdentifier
-src = src.replace(
-    'initWithFormatIdentifier:@"com.vcamplus.edit"',
-    'initWithFormatIdentifier:@"com.system.assets"',
-)
-
-# 1c. _ds() 加密版 com.vcamplus.* → com.system.*
-# 加密前缀：_ds("\x54\x58\x5A\x19..." (c-o-m-.)
-# 原 "vcamplus" 段：\x41\x54\x56\x5A\x47\x5B\x42\x44
-# 新 "system"   段：\x44\x4E\x44\x43\x52\x5A
-BRAND_OLD_PREFIX = r'\x54\x58\x5A\x19\x41\x54\x56\x5A\x47\x5B\x42\x44'
-BRAND_NEW_PREFIX = r'\x54\x58\x5A\x19\x44\x4E\x44\x43\x52\x5A'
-n_brand = src.count(BRAND_OLD_PREFIX)
-src = src.replace(BRAND_OLD_PREFIX, BRAND_NEW_PREFIX)
-if n_brand: report.append(f"✓ 编码通知名 com.vcamplus.* → com.system.* (×{n_brand})")
-
-if "com.system.assets" in src: report.append("✓ 明文标识符 → com.system.assets")
-
-# =================================================================
-# 2. 浏览器注入时机
+# 3. 浏览器 injectionTime 0 → 1
 # =================================================================
 n1 = src.count("initWithSource:js injectionTime:0 forMainFrameOnly:NO")
 src = src.replace(
@@ -102,10 +86,11 @@ n2 = src.count("initWithSource:lazyJS injectionTime:0 forMainFrameOnly:NO")
 src = src.replace(
     "initWithSource:lazyJS injectionTime:0 forMainFrameOnly:NO",
     "initWithSource:lazyJS injectionTime:1 forMainFrameOnly:NO")
-if n1 or n2: report.append(f"✓ injectionTime 0→1 (×{n1+n2})")
+if n1 or n2:
+    report.append(f"✓ injectionTime 0→1 (×{n1 + n2})")
 
 # =================================================================
-# 5 + 6. 编译修复
+# 6. FWCtrl ivar 补齐（编译修复）
 # =================================================================
 OLD_FW = """@implementation FWCtrl {
     UIButton *_colorInjectBtn;
@@ -125,24 +110,30 @@ if OLD_FW in src:
     src = src.replace(OLD_FW, NEW_FW)
     report.append("✓ FWCtrl ivar 补齐")
 else:
-    print("[!] FWCtrl @implementation 块未找到", file=sys.stderr); sys.exit(2)
+    print("[!] FWCtrl @implementation 块未找到", file=sys.stderr)
+    sys.exit(2)
 
+# =================================================================
+# 7. updateHighlight + hide 空实现（编译修复）
+# =================================================================
 OLD_SHOW = "+ (void)show {\n    return;\n}"
-NEW_SHOW = ("+ (void)show {\n    return;\n}\n"
-            "/* [PATCH] 原源码调用但未实现 — 防止 unrecognized selector */\n"
-            "- (void)updateHighlight { }")
+NEW_SHOW = (
+    "+ (void)show {\n    return;\n}\n"
+    "/* [PATCH] 原源码调用/声明但未实现 */\n"
+    "- (void)updateHighlight { }\n"
+    "+ (void)hide { }"
+)
 if OLD_SHOW in src:
     src = src.replace(OLD_SHOW, NEW_SHOW, 1)
-    report.append("✓ updateHighlight 空实现补齐")
+    report.append("✓ updateHighlight + hide 空实现")
 
 # =================================================================
-# 7. 【链接修复】VCAM_FRIEND_JS_* weak 桩
+# 8. VCAM_FRIEND_JS_* weak 桩（链接修复）
 # =================================================================
 if "VCAM_FRIEND_JS_STREAM_GET(void) { return" not in src:
-    # 插入到 vcam_buildWebCamJS 前
     anchor = "static NSString *vcam_buildWebCamJS(void) {"
     stubs = (
-        "/* [PATCH] 弱符号桩：如仓库未提供 WebCamJS 定义，用桩保证链接通过 */\n"
+        "/* [PATCH] 弱符号桩：仓库未提供 WebCamJS 定义时保链接 */\n"
         "__attribute__((weak)) NSString *VCAM_FRIEND_JS_STREAM_GET(void) "
         "{ return @\"/*stream-stub*/\"; }\n"
         "__attribute__((weak)) NSString *VCAM_FRIEND_JS_VIDEO_GET(void) "
@@ -152,17 +143,17 @@ if "VCAM_FRIEND_JS_STREAM_GET(void) { return" not in src:
     )
     if anchor in src:
         src = src.replace(anchor, stubs + anchor, 1)
-        report.append("✓ VCAM_FRIEND_JS_* weak 桩注入")
+        report.append("✓ VCAM_FRIEND_JS_* weak 桩")
 
 # =================================================================
-# 8. 防重复弹层
+# 9. 防重复弹层
 # =================================================================
 OLD_SM = """    UIViewController *topVC = vcam_topVC();
     if (!topVC || [topVC isKindOfClass:[UIAlertController class]]) return;
 """
 NEW_SM = """    UIViewController *topVC = vcam_topVC();
     if (!topVC || [topVC isKindOfClass:[UIAlertController class]]) return;
-    /* [PATCH] 防重复 */
+    /* [PATCH] 防重复弹层 */
     if ([topVC isKindOfClass:NSClassFromString(@"VCamMenu")]) {
         vcam_log(@"showMenu: already presented, skip");
         return;
@@ -173,10 +164,10 @@ if OLD_SM in src:
     report.append("✓ vcam_showMenu 防重复")
 
 # =================================================================
-# 3. UI 精简（正则 + 行级回退）
+# 4. UI 精简
 # =================================================================
 NEW_UI_LINES = [
-    "    /* [PATCH] 精简 UI：5 项核心 + 取消 */",
+    "    /* [PATCH v6] 精简 UI：5 项核心 + 取消 */",
     "    CGFloat iy = 60;",
     "    CGFloat bw = (cw - 20 - 20 - 10) / 2;",
     "    CGFloat bx1 = 20, bx2 = 20 + bw + 10;",
@@ -201,17 +192,18 @@ else:
     print("[!] UI 正则未命中，尝试行级回退...", file=sys.stderr)
     lines = src.split("\n")
     start = next((i for i, l in enumerate(lines) if "CGFloat iy = 54;" in l), None)
-    end   = next((i for i, l in enumerate(lines) if "tag:9 x:(cw - bw)" in l), None)
+    end = next((i for i, l in enumerate(lines) if "tag:9 x:(cw - bw)" in l), None)
     if start is None or end is None:
-        print("[!] UI 行级回退也失败", file=sys.stderr); sys.exit(3)
-    src = "\n".join(lines[:start] + NEW_UI_LINES + lines[end+1:])
+        print("[!] UI 行级回退失败", file=sys.stderr)
+        sys.exit(3)
+    src = "\n".join(lines[:start] + NEW_UI_LINES + lines[end + 1:])
     report.append("✓ UI 精简（行级回退）")
 
 src = src.replace("CGFloat ch = 380;", "CGFloat ch = 260;")
 report.append("✓ 卡片高度 380 → 260")
 
 # =================================================================
-# 4. 镜像按钮 tag=10
+# 5. 镜像按钮 tag=10
 # =================================================================
 OLD_BTN = """    if (tag == 9) {
         [self dismissViewControllerAnimated:YES completion:nil];
@@ -243,10 +235,11 @@ if OLD_BTN in src:
     src = src.replace(OLD_BTN, NEW_BTN, 1)
     report.append("✓ 镜像按钮 tag=10")
 else:
-    print("[!] btnTap 块未匹配", file=sys.stderr); sys.exit(4)
+    print("[!] btnTap 块未匹配", file=sys.stderr)
+    sys.exit(4)
 
 # =================================================================
-# 9. tag:8 刷新
+# 10. tag:8 标题刷新
 # =================================================================
 OLD_T8 = """            } else {
                 gTweakEnabled = YES;
@@ -275,53 +268,132 @@ if OLD_T8 in src:
     report.append("✓ tag:8 标题自动刷新")
 
 # =================================================================
-# 10. flock 保护的目录迁移
+# 11. SecTrustCopyCertificateChain iOS 14 兼容
+# =================================================================
+OLD_TRUST = """    CFArrayRef chain = SecTrustCopyCertificateChain(trust);
+    if (!chain) {
+        completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
+        return;
+    }"""
+NEW_TRUST = """    /* [PATCH] iOS 14 兼容：SecTrustCopyCertificateChain 是 iOS 15+ API */
+    CFArrayRef chain = NULL;
+    if (@available(iOS 15.0, *)) {
+        chain = SecTrustCopyCertificateChain(trust);
+    } else {
+        CFIndex cnt = SecTrustGetCertificateCount(trust);
+        CFMutableArrayRef arr = CFArrayCreateMutable(kCFAllocatorDefault, cnt,
+                                                     &kCFTypeArrayCallBacks);
+        for (CFIndex i = 0; i < cnt; i++) {
+            SecCertificateRef c = SecTrustGetCertificateAtIndex(trust, i);
+            if (c) CFArrayAppendValue(arr, c);
+        }
+        chain = arr;
+    }
+    if (!chain) {
+        completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
+        return;
+    }"""
+if OLD_TRUST in src:
+    src = src.replace(OLD_TRUST, NEW_TRUST, 1)
+    report.append("✓ SecTrust iOS 14 兼容")
+else:
+    print("[!] SecTrustCopyCertificateChain 块未匹配", file=sys.stderr)
+    sys.exit(6)
+
+# =================================================================
+# 确保 sys/file.h 已导入（flock 需要）
+# =================================================================
+if "#include <sys/file.h>" not in src:
+    src = src.replace("#include <string.h>",
+                      "#include <string.h>\n#include <sys/file.h>", 1)
+
+# =================================================================
+# 1. 【v6 核心】全量去品牌：vcamplus → cfgdatax（等长 8→8）
+# =================================================================
+def _keep_case(m):
+    s = m.group(0)
+    r = "cfgdatax"
+    if s.isupper():
+        return r.upper()
+    if s[0].isupper():
+        return r.capitalize()
+    return r
+
+
+n_brand_plain = len(re.findall(r'vcamplus', src, flags=re.IGNORECASE))
+src = re.sub(r'vcamplus', _keep_case, src, flags=re.IGNORECASE)
+
+# 编码形式替换（\xHH 序列），xor 0x37 后的 "vcamplus" → "cfgdatax"
+# 大写十六进制：\x41\x54\x56\x5A\x47\x5B\x42\x44 → \x54\x51\x50\x53\x56\x43\x56\x4F
+# 小写十六进制：\x41\x54\x56\x5a\x47\x5b\x42\x44 → \x54\x51\x50\x53\x56\x43\x56\x4f
+BRAND_ENC_PAIRS = [
+    (r'\x41\x54\x56\x5A\x47\x5B\x42\x44', r'\x54\x51\x50\x53\x56\x43\x56\x4F'),
+    (r'\x41\x54\x56\x5a\x47\x5b\x42\x44', r'\x54\x51\x50\x53\x56\x43\x56\x4f'),
+]
+n_brand_enc = 0
+for old, new in BRAND_ENC_PAIRS:
+    cnt = src.count(old)
+    if cnt:
+        src = src.replace(old, new)
+        n_brand_enc += cnt
+
+if n_brand_plain or n_brand_enc:
+    report.append(f"✓ 全量去品牌 (明文×{n_brand_plain}, 编码×{n_brand_enc})")
+
+# =================================================================
+# 2. 【v6 核心】数据迁移：vcamplus → cfgdatax（flock 保护）
+#    旧目录名用 _ds() 加密，二进制里无明文 "vcamplus"
 # =================================================================
 OLD_MIG = """        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR
             withIntermediateDirectories:YES attributes:nil error:nil];
         vcam_log([NSString stringWithFormat:@"CONSTRUCTOR: proc=%@ bid=%@", proc, bid]);"""
+
 NEW_MIG = """        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR
             withIntermediateDirectories:YES attributes:nil error:nil];
-        /* [PATCH] flock 保护的一次性迁移 vcamplus → .cfgdata */
+        /* [PATCH v6] 一次性数据迁移（旧目录名加密，二进制无明文痕迹） */
         {
-            int lockFd = open("/var/jb/var/mobile/Library/.vcam_migrate.lock",
+            int lockFd = open("/var/jb/var/mobile/Library/.cfg_migrate.lock",
                               O_CREAT | O_RDWR, 0666);
             if (lockFd >= 0 && flock(lockFd, LOCK_EX | LOCK_NB) == 0) {
                 @try {
                     NSFileManager *fm = [NSFileManager defaultManager];
-                    NSString *oldDir = @"/var/jb/var/mobile/Library/vcamplus";
+                    NSString *oldName = _ds("\\x41\\x54\\x56\\x5A\\x47\\x5B\\x42\\x44", 8);
+                    NSString *oldDir  = [@"/var/jb/var/mobile/Library"
+                                         stringByAppendingPathComponent:oldName];
+                    NSString *newDir  = @"/var/jb/var/mobile/Library/cfgdatax";
                     if ([fm fileExistsAtPath:oldDir]) {
                         NSArray *items = [fm contentsOfDirectoryAtPath:oldDir error:nil];
                         for (NSString *it in items) {
                             NSString *s = [oldDir stringByAppendingPathComponent:it];
-                            NSString *d = [VCAM_DIR stringByAppendingPathComponent:it];
+                            NSString *d = [newDir stringByAppendingPathComponent:it];
                             if (![fm fileExistsAtPath:d]) {
                                 [fm moveItemAtPath:s toPath:d error:nil];
                             }
                         }
                         [fm removeItemAtPath:oldDir error:nil];
-                        vcam_log(@"migrated vcamplus → .cfgdata");
+                        vcam_log([NSString stringWithFormat:@"migrated %@ -> cfgdatax", oldName]);
                     }
                 } @finally { close(lockFd); }
             }
         }
         vcam_log([NSString stringWithFormat:@"CONSTRUCTOR: proc=%@ bid=%@", proc, bid]);"""
+
 if OLD_MIG in src:
     src = src.replace(OLD_MIG, NEW_MIG, 1)
-    report.append("✓ flock 迁移")
+    report.append("✓ 数据迁移（旧目录名加密）")
+else:
+    print("[!] 迁移锚点未匹配", file=sys.stderr)
+    sys.exit(7)
 
 # =================================================================
 # 写回
 # =================================================================
 if src == original:
-    print("[!] 无变更", file=sys.stderr); sys.exit(5)
-
-# 确保 <sys/file.h> 已导入（flock 需要）
-if "#include <sys/file.h>" not in src:
-    src = src.replace("#include <string.h>",
-                      "#include <string.h>\n#include <sys/file.h>", 1)
+    print("[!] 无变更", file=sys.stderr)
+    sys.exit(8)
 
 TWEAK.write_text(src, encoding="utf-8")
 print(f"[+] 补丁成功：{TWEAK}")
-for r in report: print("   ", r)
+for r in report:
+    print("   ", r)
 print(f"[+] 共 {len(report)} 项")
