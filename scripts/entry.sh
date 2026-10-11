@@ -2,7 +2,7 @@
 # 补丁方式进入 —— 未过补丁不允许构建
 # 兼容 macOS bash 3.2（无 mapfile）
 # 兼容任意源文件名（如「主源码Tweak.xm」）
-# v6: 校验清单已同步到 cfgdatax 品牌策略
+# v6.1: 校验清单已同步（移除迁移检查，二进制必须完全无 vcamplus）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -70,7 +70,7 @@ echo "[*] 应用补丁到：$TARGET"
 python3 patches/apply_patch.py
 
 # ---------------------------------------------------------------
-# Python 校验（跨平台，v6 品牌策略）
+# Python 校验（跨平台，v6.1 品牌策略）
 # ---------------------------------------------------------------
 echo "[*] 补丁校验（Python）..."
 VCAM_TWEAK_PATH="$TARGET" python3 - <<'PY'
@@ -78,7 +78,7 @@ import os, re, sys
 p = os.environ["VCAM_TWEAK_PATH"]
 src = open(p, encoding="utf-8").read()
 
-# ---------- 正向检查：v6 补丁的所有特征标记 ----------
+# ---------- 正向检查：v6.1 补丁的所有特征标记 ----------
 checks = [
     ("cfgdatax",                                 "品牌未替换"),
     ("injectionTime:1 forMainFrameOnly:NO",      "injectionTime 未改"),
@@ -88,7 +88,6 @@ checks = [
     ("void)hide { }",                            "hide 未补"),
     ("VCAM_FRIEND_JS_STREAM_GET(void) { return", "weak 桩未注入"),
     ("if (@available(iOS 15.0, *))",             "SecTrust iOS 14 兼容未注入"),
-    ("cfg_migrate.lock",                         "数据迁移未注入"),
 ]
 fail = False
 for needle, msg in checks:
@@ -97,16 +96,13 @@ for needle, msg in checks:
         fail = True
 
 # ---------- 反向检查：不允许残留明文 vcamplus ----------
-# 注意：加密形式 \x41\x54\x56\x5A... 会在 v6 补丁中被替换掉，
-#       迁移代码里的旧目录名用 _ds() 加密保存，源码明文里不应出现。
 if "vcamplus" in src.lower():
     print("[!] 源码里仍残留明文 vcamplus：", file=sys.stderr)
     for m in re.finditer(r'.{0,40}vcamplus.{0,40}', src, re.IGNORECASE):
         print(f"    {m.group(0)}", file=sys.stderr)
     fail = True
 
-# ---------- 反向检查：不允许残留旧编码 ----------
-# vcamplus 的两种编码形态（大写/小写 hex）都不应存在
+# ---------- 反向检查：不允许残留 vcamplus 的编码字节 ----------
 for old_enc in [
     r'\x41\x54\x56\x5A\x47\x5B\x42\x44',
     r'\x41\x54\x56\x5a\x47\x5b\x42\x44',
@@ -115,15 +111,19 @@ for old_enc in [
         print(f"[!] 源码里仍残留编码形式 vcamplus：`{old_enc}`", file=sys.stderr)
         fail = True
 
-# ---------- 反向检查：不允许残留旧品牌目录路径 ----------
+# ---------- 反向检查：不允许残留 v4 临时标记 ----------
 for old_path in [
-    'Library/.cfgdata',   # v4 曾用过的临时名
-    'com.system.',        # v4 曾用过的临时前缀
+    'Library/.cfgdata',
+    'com.system.',
 ]:
     if old_path in src:
-        print(f"[!] 检测到 v4 残留标记 `{old_path}`（应已被 cfgdatax 策略取代）",
-              file=sys.stderr)
+        print(f"[!] 检测到 v4 残留标记 `{old_path}`", file=sys.stderr)
         fail = True
+
+# ---------- 反向检查：不允许 v6 自动迁移代码残留 ----------
+if "cfg_migrate.lock" in src:
+    print("[!] 检测到 v6 自动迁移代码残留（应已移除）", file=sys.stderr)
+    fail = True
 
 if fail:
     sys.exit(1)
