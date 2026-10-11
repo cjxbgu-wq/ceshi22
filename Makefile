@@ -7,7 +7,8 @@ export PATH := $(THEOS)/bin:$(PATH)
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VCamPlus
-VCamPlus_FILES = Tweak.xm
+# ★ 关键：加入 vcam_friend_js.mm 让链接器找到符号
+VCamPlus_FILES = Tweak.xm vcam_friend_js.mm
 VCamPlus_CFLAGS = -fobjc-arc \
     -Wno-deprecated-declarations \
     -Wno-unused-function \
