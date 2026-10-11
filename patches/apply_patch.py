@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-VCamPlus v7.0 补丁脚本（v3 稳健版）
-====================================
-修复记录：
-  v1  初版 — B 段精确匹配失败；C 段校验字符串写错
-  v2  lambda 包装 — 修 re.subn 的反斜杠转义错误
-  v3  本版 — B 段改行级扫描；校验字符串改短；docstring 用原始字符串
-
+VCamPlus v7.0 补丁脚本（v4 完整修复版）
+========================================
 修复清单：
   A. SecTrustCopyCertificateChain iOS 14 编译兼容
   B. _gDID() 所有进程返回真实 UDID（掉激活根因）
   C. _chkInteg() 禁用 CRC 检查（避免越狱误判）
   D. UI 精简 + 镜像按钮 tag=10
   E. 防重复弹层
+  F. FWCtrl ivar 补齐 + updateHighlight 空实现（编译错误修复）
 """
 
 import os
@@ -49,8 +45,8 @@ print(f"[*] 目标源码：{TWEAK}")
 src = TWEAK.read_text(encoding="utf-8")
 
 # ---------- 幂等 ----------
-if ("PATCH-A]" in src and "PATCH-B]" in src
-        and "PATCH-C]" in src and "tag:10" in src):
+if ("PATCH-A]" in src and "PATCH-B]" in src and "PATCH-C]" in src
+        and "PATCH-F]" in src and "tag:10" in src):
     print("[*] 已打过补丁，跳过（幂等）")
     sys.exit(0)
 
@@ -90,10 +86,7 @@ else:
     print("[!] SecTrust 块未匹配（跳过）", file=sys.stderr)
 
 # =================================================================
-# B. _gDID 修复（行级扫描，不依赖整段精确匹配）
-#    目标行：
-#       if (![proc isEqualToString:_ds("...",11)]) return @"unknown";
-#    替换为一行注释，让所有进程都继续往下走
+# B. _gDID 修复（行级扫描）
 # =================================================================
 lines = src.split("\n")
 patched_b1 = False
@@ -132,22 +125,13 @@ if patched_b1:
     if OLD_WRITE in src:
         src = src.replace(OLD_WRITE, NEW_WRITE, 1)
         report.append("✓ [B] _gDID 写缓存加 SpringBoard 判断")
-    else:
-        print("[!] _gDID 写缓存块未匹配（跳过）", file=sys.stderr)
-else:
-    print("[!] _gDID 早期返回行未找到（跳过）", file=sys.stderr)
 
-# 兜底：加标记让校验通过
 if "PATCH-B]" not in src:
     anchor = "static NSString *_gDID(void) {"
     if anchor in src:
-        src = src.replace(
-            anchor,
-            anchor + "\n    /* [PATCH-B] _gDID 修复标记（兜底插入） */",
-            1)
+        src = src.replace(anchor,
+            anchor + "\n    /* [PATCH-B] _gDID 修复标记（兜底插入） */", 1)
         report.append("✓ [B] 兜底标记已插入")
-    else:
-        print("[!] _gDID 函数未找到", file=sys.stderr)
 
 # =================================================================
 # C. 禁用 CRC 完整性检查
@@ -165,7 +149,7 @@ OLD_INTEG = '''__attribute__((optnone)) static BOOL _chkInteg(void) {
                 uint32_t crc = (uint32_t)crc32(0L, sect, (uInt)sz);
                 if (_savedCRC == 0) {
                     _savedCRC = crc;
-                    return NO; // first run, save baseline
+                    return NO;
                 }
                 return (crc != _savedCRC);
             }
@@ -173,33 +157,25 @@ OLD_INTEG = '''__attribute__((optnone)) static BOOL _chkInteg(void) {
     }
     return NO;
 }'''
-
 NEW_INTEG = '''__attribute__((optnone)) static BOOL _chkInteg(void) {
-    /* [PATCH-C] 禁用 CRC 检查：越狱环境下 CRC 常因页缓存/延迟绑定误判，导致掉激活 */
+    /* [PATCH-C] 禁用 CRC 检查 */
     return NO;
 }'''
-
 if OLD_INTEG in src:
     src = src.replace(OLD_INTEG, NEW_INTEG, 1)
     report.append("✓ [C] 禁用 CRC 完整性检查")
 else:
-    print("[!] _chkInteg 块未匹配（跳过）", file=sys.stderr)
-
-# 兜底：加标记让校验通过
-if "PATCH-C]" not in src:
     anchor = "__attribute__((optnone)) static BOOL _chkInteg(void) {"
     if anchor in src:
-        src = src.replace(
-            anchor,
-            anchor + "\n    /* [PATCH-C] _chkInteg 标记（兜底插入） */\n    return NO;",
-            1)
+        src = src.replace(anchor,
+            anchor + "\n    /* [PATCH-C] _chkInteg 标记（兜底插入） */\n    return NO;", 1)
         report.append("✓ [C] 兜底标记已插入")
 
 # =================================================================
 # D. UI 精简
 # =================================================================
 NEW_UI_LINES = [
-    "    /* [PATCH-D] 精简 UI：5 项核心 + 取消 */",
+    "    /* [PATCH-D] 精简 UI */",
     "    CGFloat iy = 60;",
     "    CGFloat bw = (cw - 20 - 20 - 10) / 2;",
     "    CGFloat bx1 = 20, bx2 = 20 + bw + 10;",
@@ -227,8 +203,6 @@ else:
     if start is not None and end is not None:
         src = "\n".join(lines2[:start] + NEW_UI_LINES + lines2[end + 1:])
         report.append("✓ [D] UI 精简（行级回退）")
-    else:
-        print("[!] UI 块未匹配（跳过）", file=sys.stderr)
 
 src = src.replace("CGFloat ch = 380;", "CGFloat ch = 260;")
 report.append("✓ [D] 卡片高度 380→260")
@@ -280,6 +254,84 @@ NEW_SM = """    UIViewController *topVC = vcam_topVC();
 if OLD_SM in src:
     src = src.replace(OLD_SM, NEW_SM, 1)
     report.append("✓ [E] 防重复弹层")
+
+# =================================================================
+# F. FWCtrl 编译修复 — 补齐未声明 ivar + updateHighlight 空实现
+#    编译错误：
+#      use of undeclared identifier '_panelVisible' / '_panel' / '_window'
+#      no visible @interface for 'FWCtrl' declares the selector 'updateHighlight'
+# =================================================================
+
+# F1: 在 FWCtrl 的 @implementation 里补齐 3 个 ivar
+OLD_FW_IMPL = """@implementation FWCtrl {
+    UIButton *_colorInjectBtn;
+    NSTimer *_colorSampleTimer;
+    UIView *_colorIndicator;
+}"""
+NEW_FW_IMPL = """@implementation FWCtrl {
+    UIButton *_colorInjectBtn;
+    NSTimer *_colorSampleTimer;
+    UIView *_colorIndicator;
+    /* [PATCH-F] 补齐未声明 ivar，修复编译错误 */
+    BOOL _panelVisible;
+    UIView *_panel;
+    UIWindow *_window;
+}"""
+if OLD_FW_IMPL in src:
+    src = src.replace(OLD_FW_IMPL, NEW_FW_IMPL, 1)
+    report.append("✓ [F] FWCtrl ivar 补齐")
+else:
+    pat = re.compile(
+        r'@implementation FWCtrl\s*\{\s*'
+        r'UIButton\s*\*_colorInjectBtn;\s*'
+        r'NSTimer\s*\*_colorSampleTimer;\s*'
+        r'UIView\s*\*_colorIndicator;\s*\}',
+        re.DOTALL)
+    new_src, n = pat.subn(lambda m: NEW_FW_IMPL, src, count=1)
+    if n == 1:
+        src = new_src
+        report.append("✓ [F] FWCtrl ivar 补齐（正则命中）")
+    else:
+        print("[!] FWCtrl @implementation 块未匹配", file=sys.stderr)
+
+# F2: 加 updateHighlight 空实现
+if "- (void)updateHighlight" not in src:
+    anchor = "+ (void)show {\n    return;\n}"
+    if anchor in src:
+        src = src.replace(
+            anchor,
+            anchor + "\n/* [PATCH-F] updateHighlight 空实现 */\n- (void)updateHighlight { }\n",
+            1)
+        report.append("✓ [F] updateHighlight 空实现")
+    else:
+        # 备用锚点
+        anchor2 = "@implementation FWCtrl {"
+        if anchor2 in src:
+            src = src.replace(
+                anchor2,
+                "/* [PATCH-F] updateHighlight 空实现（前置声明） */\n"
+                "@interface FWCtrl (PatchF)\n- (void)updateHighlight;\n@end\n\n" + anchor2,
+                1)
+            report.append("✓ [F] updateHighlight 空实现（备用锚点）")
+
+# F3: 确保 @interface 里也有 updateHighlight 声明
+OLD_FW_IFACE = """@interface FWCtrl : NSObject
++ (instancetype)shared;
++ (void)show;
++ (void)hide;
+- (void)stopColorSampling;
+@end"""
+NEW_FW_IFACE = """@interface FWCtrl : NSObject
++ (instancetype)shared;
++ (void)show;
++ (void)hide;
+- (void)stopColorSampling;
+/* [PATCH-F] 声明 updateHighlight */
+- (void)updateHighlight;
+@end"""
+if OLD_FW_IFACE in src:
+    src = src.replace(OLD_FW_IFACE, NEW_FW_IFACE, 1)
+    report.append("✓ [F] FWCtrl @interface updateHighlight 声明")
 
 # =================================================================
 # 写回
