@@ -1,0 +1,7 @@
+.theos/
+packages/
+obj/
+*.deb
+*.xcuserstate
+.DS_Store
+.patched
