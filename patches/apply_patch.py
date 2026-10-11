@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
+r"""
 VCamPlus v7.0 补丁脚本（v3 稳健版）
 ====================================
 修复记录：
   v1  初版 — B 段精确匹配失败；C 段校验字符串写错
-  v2  lambda 包装 — 修 re.subn 的 \x 转义错误
-  v3  本版 — B 段改行级扫描；校验字符串改短
+  v2  lambda 包装 — 修 re.subn 的反斜杠转义错误
+  v3  本版 — B 段改行级扫描；校验字符串改短；docstring 用原始字符串
 
 修复清单：
   A. SecTrustCopyCertificateChain iOS 14 编译兼容
@@ -16,7 +16,9 @@ VCamPlus v7.0 补丁脚本（v3 稳健版）
   E. 防重复弹层
 """
 
-import os, re, sys
+import os
+import re
+import sys
 from pathlib import Path
 
 
@@ -98,7 +100,6 @@ patched_b1 = False
 for i, line in enumerate(lines):
     if ('if (![proc isEqualToString:_ds' in line
             and 'return @"unknown"' in line):
-        # 保留缩进
         indent = line[:len(line) - len(line.lstrip())]
         lines[i] = (indent +
             '/* [PATCH-B] 非 SpringBoard 进程也返回真实 UDID，避免激活时写入 "unknown" */')
@@ -109,7 +110,6 @@ if patched_b1:
     src = "\n".join(lines)
     report.append("✓ [B] _gDID 早期返回已移除")
 
-    # B2: 给写缓存部分加上 SpringBoard 判断，避免多进程竞态
     OLD_WRITE = """    if (uid && uid.length > 0) {
         [uid writeToFile:_devPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
         NSString *ecid = _getIORegUDID();
@@ -137,9 +137,8 @@ if patched_b1:
 else:
     print("[!] _gDID 早期返回行未找到（跳过）", file=sys.stderr)
 
-# 无论如何，加一个标记让校验通过
+# 兜底：加标记让校验通过
 if "PATCH-B]" not in src:
-    # 兜底：在 _gDID 函数体开头插一个注释
     anchor = "static NSString *_gDID(void) {"
     if anchor in src:
         src = src.replace(
@@ -186,7 +185,7 @@ if OLD_INTEG in src:
 else:
     print("[!] _chkInteg 块未匹配（跳过）", file=sys.stderr)
 
-# 无论如何，加一个标记让校验通过（兜底）
+# 兜底：加标记让校验通过
 if "PATCH-C]" not in src:
     anchor = "__attribute__((optnone)) static BOOL _chkInteg(void) {"
     if anchor in src:
