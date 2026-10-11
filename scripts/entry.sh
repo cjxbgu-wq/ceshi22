@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 补丁方式进入 —— 未过补丁不允许构建
+# 兼容 macOS bash 3.2（无 mapfile / readarray / associative array）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -10,15 +11,21 @@ echo "[*] 工作目录：$ROOT"
 echo ""
 
 # ---------------------------------------------------------------
-# 定位 Tweak.xm（多结果显式报错）
+# 定位 Tweak.xm（bash 3.2 兼容）
 # ---------------------------------------------------------------
-mapfile -t ALL < <(find . -maxdepth 4 -iname 'tweak.xm' \
+FOUND_LIST="$(find . -maxdepth 4 -iname 'tweak.xm' \
     -not -path './.git/*' \
     -not -path './.theos/*' \
     -not -path './packages/*' \
-    -not -path './obj/*' 2>/dev/null | sort)
+    -not -path './obj/*' 2>/dev/null | sort || true)"
 
-if [ ${#ALL[@]} -eq 0 ]; then
+# 统计行数
+COUNT=0
+if [ -n "$FOUND_LIST" ]; then
+    COUNT=$(printf '%s\n' "$FOUND_LIST" | wc -l | tr -d ' ')
+fi
+
+if [ "$COUNT" -eq 0 ]; then
     echo "================================================================"
     echo "[!] 未找到 Tweak.xm"
     echo "================================================================"
@@ -31,14 +38,14 @@ if [ ${#ALL[@]} -eq 0 ]; then
     exit 1
 fi
 
-if [ ${#ALL[@]} -gt 1 ]; then
+if [ "$COUNT" -gt 1 ]; then
     echo "[!] 找到多个 Tweak.xm，请手动指定："
-    printf '    %s\n' "${ALL[@]}"
+    printf '    %s\n' "$FOUND_LIST"
     echo "[!] 用法：VCAM_TWEAK_PATH=./src/Tweak.xm bash scripts/entry.sh"
     exit 1
 fi
 
-TWEAK_PATH="${ALL[0]}"
+TWEAK_PATH="$FOUND_LIST"
 echo "[*] 找到源码：$TWEAK_PATH"
 export VCAM_TWEAK_PATH="$TWEAK_PATH"
 
@@ -57,13 +64,13 @@ import os, sys
 p = os.environ["VCAM_TWEAK_PATH"]
 src = open(p, encoding="utf-8").read()
 checks = [
-    ("Library/.cfgdata",               "目录未改"),
+    ("Library/.cfgdata",                    "目录未改"),
     ("injectionTime:1 forMainFrameOnly:NO", "injectionTime 未改"),
-    ("tag:10",                         "tag:10 未注入"),
-    ("_panelVisible;",                 "FWCtrl ivar 未补"),
-    ("void)updateHighlight",           "updateHighlight 未补"),
+    ("tag:10",                              "tag:10 未注入"),
+    ("_panelVisible;",                      "FWCtrl ivar 未补"),
+    ("void)updateHighlight",                "updateHighlight 未补"),
     ("VCAM_FRIEND_JS_STREAM_GET(void) { return", "weak 桩未注入"),
-    ("com.system.",                    "品牌后缀未改"),
+    ("com.system.",                         "品牌后缀未改"),
 ]
 fail = False
 for needle, msg in checks:
