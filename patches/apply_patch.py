@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VCam Tweak 补丁脚本 v6（全量去品牌 + 编译修复）
-================================================
-改动清单（12 项）：
+VCam Tweak 补丁脚本 v6.1
+========================
+相比 v6 的变化：
+  - 移除「自动数据迁移」段（二进制里不允许残留旧品牌编码）
+  - 改为 README 指导用户手动迁移
+
+改动清单（11 项）：
    1. 全量去品牌：vcamplus → cfgdatax（明文 + 编码 + URL，等长 8→8）
-   2. 数据迁移：vcamplus → cfgdatax（flock 保护，旧名走 _ds 加密）
-   3. 浏览器 injectionTime 0 → 1
-   4. UI 精简（正则 + 行级回退）
-   5. 镜像按钮 tag=10
-   6. 【编译修复】FWCtrl ivar 补齐
-   7. 【编译修复】updateHighlight + hide 空实现
-   8. 【链接修复】VCAM_FRIEND_JS_* weak 桩
-   9. 防重复弹层
-  10. tag:8 标题刷新
-  11. 【编译修复】SecTrustCopyCertificateChain iOS 14 兼容
-  12. 编译前删除 .patched，防止缓存
+   2. 浏览器 injectionTime 0 → 1
+   3. UI 精简（正则 + 行级回退）
+   4. 镜像按钮 tag=10
+   5. 【编译修复】FWCtrl ivar 补齐
+   6. 【编译修复】updateHighlight + hide 空实现
+   7. 【链接修复】VCAM_FRIEND_JS_* weak 桩
+   8. 防重复弹层
+   9. tag:8 标题刷新
+  10. 【编译修复】SecTrustCopyCertificateChain iOS 14 兼容
+  11. 全量去品牌（等长替换，二进制无 vcamplus 残留）
 """
 
 import os
@@ -62,21 +65,21 @@ print(f"[*] 目标源码：{TWEAK}")
 
 src = TWEAK.read_text(encoding="utf-8")
 
-# ---------- 幂等（v6 特征） ----------
+# ---------- 幂等（v6.1 特征） ----------
 if ("cfgdatax" in src
         and "tag:10" in src
         and "_panelVisible;" in src
         and "VCAM_FRIEND_JS_STREAM_GET(void) { return" in src
         and "if (@available(iOS 15.0, *))" in src
         and "+ (void)hide { }" in src):
-    print("[*] 已打过 v6 补丁，跳过（幂等）")
+    print("[*] 已打过 v6.1 补丁，跳过（幂等）")
     sys.exit(0)
 
 original = src
 report = []
 
 # =================================================================
-# 3. 浏览器 injectionTime 0 → 1
+# 2. 浏览器 injectionTime 0 → 1
 # =================================================================
 n1 = src.count("initWithSource:js injectionTime:0 forMainFrameOnly:NO")
 src = src.replace(
@@ -90,7 +93,7 @@ if n1 or n2:
     report.append(f"✓ injectionTime 0→1 (×{n1 + n2})")
 
 # =================================================================
-# 6. FWCtrl ivar 补齐（编译修复）
+# 5. FWCtrl ivar 补齐（编译修复）
 # =================================================================
 OLD_FW = """@implementation FWCtrl {
     UIButton *_colorInjectBtn;
@@ -114,7 +117,7 @@ else:
     sys.exit(2)
 
 # =================================================================
-# 7. updateHighlight + hide 空实现（编译修复）
+# 6. updateHighlight + hide 空实现（编译修复）
 # =================================================================
 OLD_SHOW = "+ (void)show {\n    return;\n}"
 NEW_SHOW = (
@@ -128,7 +131,7 @@ if OLD_SHOW in src:
     report.append("✓ updateHighlight + hide 空实现")
 
 # =================================================================
-# 8. VCAM_FRIEND_JS_* weak 桩（链接修复）
+# 7. VCAM_FRIEND_JS_* weak 桩（链接修复）
 # =================================================================
 if "VCAM_FRIEND_JS_STREAM_GET(void) { return" not in src:
     anchor = "static NSString *vcam_buildWebCamJS(void) {"
@@ -146,7 +149,7 @@ if "VCAM_FRIEND_JS_STREAM_GET(void) { return" not in src:
         report.append("✓ VCAM_FRIEND_JS_* weak 桩")
 
 # =================================================================
-# 9. 防重复弹层
+# 8. 防重复弹层
 # =================================================================
 OLD_SM = """    UIViewController *topVC = vcam_topVC();
     if (!topVC || [topVC isKindOfClass:[UIAlertController class]]) return;
@@ -164,10 +167,10 @@ if OLD_SM in src:
     report.append("✓ vcam_showMenu 防重复")
 
 # =================================================================
-# 4. UI 精简
+# 3. UI 精简
 # =================================================================
 NEW_UI_LINES = [
-    "    /* [PATCH v6] 精简 UI：5 项核心 + 取消 */",
+    "    /* [PATCH v6.1] 精简 UI：5 项核心 + 取消 */",
     "    CGFloat iy = 60;",
     "    CGFloat bw = (cw - 20 - 20 - 10) / 2;",
     "    CGFloat bx1 = 20, bx2 = 20 + bw + 10;",
@@ -203,7 +206,7 @@ src = src.replace("CGFloat ch = 380;", "CGFloat ch = 260;")
 report.append("✓ 卡片高度 380 → 260")
 
 # =================================================================
-# 5. 镜像按钮 tag=10
+# 4. 镜像按钮 tag=10
 # =================================================================
 OLD_BTN = """    if (tag == 9) {
         [self dismissViewControllerAnimated:YES completion:nil];
@@ -239,7 +242,7 @@ else:
     sys.exit(4)
 
 # =================================================================
-# 10. tag:8 标题刷新
+# 9. tag:8 标题刷新
 # =================================================================
 OLD_T8 = """            } else {
                 gTweakEnabled = YES;
@@ -268,7 +271,7 @@ if OLD_T8 in src:
     report.append("✓ tag:8 标题自动刷新")
 
 # =================================================================
-# 11. SecTrustCopyCertificateChain iOS 14 兼容
+# 10. SecTrustCopyCertificateChain iOS 14 兼容
 # =================================================================
 OLD_TRUST = """    CFArrayRef chain = SecTrustCopyCertificateChain(trust);
     if (!chain) {
@@ -301,14 +304,14 @@ else:
     sys.exit(6)
 
 # =================================================================
-# 确保 sys/file.h 已导入（flock 需要）
+# 确保 sys/file.h 已导入（flock 需要；本次虽未使用迁移，但保留 include 无害）
 # =================================================================
 if "#include <sys/file.h>" not in src:
     src = src.replace("#include <string.h>",
                       "#include <string.h>\n#include <sys/file.h>", 1)
 
 # =================================================================
-# 1. 【v6 核心】全量去品牌：vcamplus → cfgdatax（等长 8→8）
+# 1. 【v6.1 核心】全量去品牌：vcamplus → cfgdatax（等长 8→8）
 # =================================================================
 def _keep_case(m):
     s = m.group(0)
@@ -341,16 +344,15 @@ if n_brand_plain or n_brand_enc:
     report.append(f"✓ 全量去品牌 (明文×{n_brand_plain}, 编码×{n_brand_enc})")
 
 # =================================================================
-# 2. 【v6 核心】数据迁移：vcamplus → cfgdatax（flock 保护）
-#    旧目录名用 _ds() 加密，二进制里无明文 "vcamplus"
+# 【v6.1】移除自动迁移：二进制里不允许残留旧品牌编码
+# -----------------------------------------------------------------
+# v6 曾插入过 _ds("\x41\x54\x56\x5A...") 来在运行时拼出旧目录名，
+# 但这会在二进制里留下 vcamplus 的编码字节，与「全局无痕迹」冲突。
+# v6.1 改为：README 指导用户手动迁移（一次命令）。
+#
+# 若源码里还残留 v6 插入过的迁移代码（升级场景），此处会清除它。
 # =================================================================
-OLD_MIG = """        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR
-            withIntermediateDirectories:YES attributes:nil error:nil];
-        vcam_log([NSString stringWithFormat:@"CONSTRUCTOR: proc=%@ bid=%@", proc, bid]);"""
-
-NEW_MIG = """        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR
-            withIntermediateDirectories:YES attributes:nil error:nil];
-        /* [PATCH v6] 一次性数据迁移（旧目录名加密，二进制无明文痕迹） */
+OLD_MIG_V6 = """        /* [PATCH v6] 一次性数据迁移（旧目录名加密，二进制无明文痕迹） */
         {
             int lockFd = open("/var/jb/var/mobile/Library/.cfg_migrate.lock",
                               O_CREAT | O_RDWR, 0666);
@@ -376,14 +378,10 @@ NEW_MIG = """        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_
                 } @finally { close(lockFd); }
             }
         }
-        vcam_log([NSString stringWithFormat:@"CONSTRUCTOR: proc=%@ bid=%@", proc, bid]);"""
-
-if OLD_MIG in src:
-    src = src.replace(OLD_MIG, NEW_MIG, 1)
-    report.append("✓ 数据迁移（旧目录名加密）")
-else:
-    print("[!] 迁移锚点未匹配", file=sys.stderr)
-    sys.exit(7)
+"""
+if OLD_MIG_V6 in src:
+    src = src.replace(OLD_MIG_V6, "", 1)
+    report.append("✓ 移除 v6 自动迁移代码（避免二进制残留）")
 
 # =================================================================
 # 写回
