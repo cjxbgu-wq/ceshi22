@@ -19,7 +19,6 @@ jobs:
 
       - name: 应用补丁 + 校验
         run: bash scripts/entry.sh
-        # 该脚本内部会：跑补丁 → grep 校验 → touch .patched
 
       - name: 安装 Theos
         run: |
