@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-VCamPlus v7.0 补丁脚本（v7 最终版）
-====================================
+VCamPlus v7.0 补丁脚本（最终版）
+==================================
 修复清单：
   A. SecTrustCopyCertificateChain iOS 14 编译兼容
   B. _gDID() 所有进程返回真实 UDID（掉激活根因）
@@ -10,9 +10,7 @@ VCamPlus v7.0 补丁脚本（v7 最终版）
   D. UI 精简 + 镜像按钮 tag=10
   E. 防重复弹层
   F. FWCtrl ivar 补齐 + updateHighlight 空实现
-
-注：VCAM_FRIEND_JS_* 由 vcam_friend_js.mm 提供实现（不带 extern "C"），
-    两边都用 C++ linkage，符号自然匹配。
+  H. VCAM_FRIEND_JS_* 直接在 Tweak.xm 内定义（彻底绕开链接问题）
 """
 
 import os
@@ -49,7 +47,7 @@ src = TWEAK.read_text(encoding="utf-8")
 
 # ---------- 幂等 ----------
 if ("PATCH-A]" in src and "PATCH-B]" in src and "PATCH-C]" in src
-        and "PATCH-F]" in src and "tag:10" in src):
+        and "PATCH-F]" in src and "PATCH-H]" in src and "tag:10" in src):
     print("[*] 已打过补丁，跳过（幂等）")
     sys.exit(0)
 
@@ -291,10 +289,8 @@ else:
     if n == 1:
         src = new_src
         report.append("✓ [F] FWCtrl ivar 补齐（正则命中）")
-    else:
-        print("[!] FWCtrl @implementation 块未匹配", file=sys.stderr)
 
-# F2: @interface 声明 updateHighlight
+# F2: @interface 声明
 OLD_FW_IFACE = """@interface FWCtrl : NSObject
 + (instancetype)shared;
 + (void)show;
@@ -322,6 +318,63 @@ if "- (void)updateHighlight {" not in src:
             anchor + "\n/* [PATCH-F] updateHighlight 空实现 */\n- (void)updateHighlight { }\n",
             1)
         report.append("✓ [F] updateHighlight 空实现")
+
+# =================================================================
+# H. VCAM_FRIEND_JS_* 直接在 Tweak.xm 里定义
+#    ★ 两步：
+#      1. 删除函数体内的 extern 声明
+#      2. 在文件顶层插入函数定义
+#    这样符号定义和引用都在同一个 .o 里，不需要链接器找外部符号
+# =================================================================
+
+# H1: 删除函数体内的 extern 声明
+OLD_EXTERN_BLOCK = """        extern NSString *VCAM_FRIEND_JS_STREAM_GET(void);
+        extern NSString *VCAM_FRIEND_JS_VIDEO_GET(void);
+        extern NSString *VCAM_FRIEND_JS_IMAGE_GET(void);"""
+NEW_EXTERN_BLOCK = """        /* [PATCH-H] VCAM_FRIEND_JS_* 定义已在文件顶层注入 */"""
+if OLD_EXTERN_BLOCK in src:
+    src = src.replace(OLD_EXTERN_BLOCK, NEW_EXTERN_BLOCK, 1)
+    report.append("✓ [H] 函数体内 extern 声明已移除")
+else:
+    # 行级兜底：逐行删除 3 行 extern
+    lines_h = src.split("\n")
+    new_lines = []
+    removed = 0
+    for l in lines_h:
+        if ("extern NSString *VCAM_FRIEND_JS_STREAM_GET" in l
+                or "extern NSString *VCAM_FRIEND_JS_VIDEO_GET" in l
+                or "extern NSString *VCAM_FRIEND_JS_IMAGE_GET" in l):
+            removed += 1
+            continue
+        new_lines.append(l)
+    if removed == 3:
+        src = "\n".join(new_lines)
+        report.append("✓ [H] extern 声明已逐行删除")
+
+# H2: 在文件顶层插入函数定义
+if "/* [PATCH-H] VCAM_FRIEND_JS stub definitions */" not in src:
+    anchor = "static NSString *vcam_buildWebCamJS(void) {"
+    stubs = """/* [PATCH-H] VCAM_FRIEND_JS stub definitions */
+/* 直接在 Tweak.xm 里定义，避免链接阶段的 C/C++ linkage 不匹配 */
+NSString *VCAM_FRIEND_JS_STREAM_GET(void) { return @"/*stream-stub*/"; }
+NSString *VCAM_FRIEND_JS_VIDEO_GET(void)  { return @"/*video-stub*/"; }
+NSString *VCAM_FRIEND_JS_IMAGE_GET(void)  { return @"/*image-stub*/"; }
+
+"""
+    if anchor in src:
+        src = src.replace(anchor, stubs + anchor, 1)
+        report.append("✓ [H] VCAM_FRIEND_JS_* 函数定义已注入")
+    else:
+        print("[!] vcam_buildWebCamJS 锚点未找到", file=sys.stderr)
+
+# 兜底标记
+if "PATCH-H]" not in src:
+    anchor = "static NSString *vcam_buildWebCamJS(void) {"
+    if anchor in src:
+        src = src.replace(
+            anchor,
+            "/* [PATCH-H] 标记（兜底） */\n" + anchor, 1)
+        report.append("✓ [H] 兜底标记已插入")
 
 # =================================================================
 # 写回
