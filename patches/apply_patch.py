@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VCamPlus v7.0 补丁脚本
-======================
+VCamPlus v7.0 补丁脚本（修正版）
+================================
 针对 v7.0 源码的最小必要修复：
 
   A. SecTrustCopyCertificateChain iOS 14 编译兼容  ← 编译必须
@@ -10,6 +10,9 @@ VCamPlus v7.0 补丁脚本
   C. _chkInteg() 禁用 CRC 检查                        ← 避免误判掉激活
   D. UI 精简 + 镜像按钮 tag=10                         ← 之前要求
   E. tag:8 标题刷新 + 防重复弹层                       ← 健壮性
+
+修正：所有 re.subn 的 replacement 用 lambda 包装，避免 NEW_GDID 中的
+     \\x 被 Python 正则引擎解析为"坏转义" (re.error: bad escape \\x)
 """
 
 import os, re, sys
@@ -20,29 +23,36 @@ def locate_tweak() -> Path:
     env = os.environ.get("VCAM_TWEAK_PATH")
     if env:
         p = Path(env)
-        if not p.is_absolute(): p = Path.cwd() / p
-        if p.exists(): return p
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        if p.exists():
+            return p
     root = Path(__file__).resolve().parent.parent
     for c in [root / "Tweak.xm", root / "tweak.xm", root / "src" / "Tweak.xm"]:
-        if c.exists(): return c
+        if c.exists():
+            return c
     for p in sorted(root.rglob("*.xm")):
         s = str(p)
-        if any(x in s for x in ("/.git/", "/.theos/", "/packages/", "/obj/")): continue
-        if "tweak" in p.name.lower(): return p
-    print("[!] 未找到 Tweak.xm", file=sys.stderr); sys.exit(1)
+        if any(x in s for x in ("/.git/", "/.theos/", "/packages/", "/obj/")):
+            continue
+        if "tweak" in p.name.lower():
+            return p
+    print("[!] 未找到 Tweak.xm", file=sys.stderr)
+    sys.exit(1)
 
 
 TWEAK = locate_tweak()
 print(f"[*] 目标源码：{TWEAK}")
 src = TWEAK.read_text(encoding="utf-8")
 
-# 幂等
+# ---------- 幂等 ----------
 if ("PATCH-A] SecTrust" in src and "PATCH-B] _gDID" in src
         and "PATCH-C] _chkInteg" in src and "tag:10" in src):
-    print("[*] 已打过补丁，跳过")
+    print("[*] 已打过补丁，跳过（幂等）")
     sys.exit(0)
 
-original, report = src, []
+original = src
+report = []
 
 # =================================================================
 # A. SecTrustCopyCertificateChain iOS 14 兼容
@@ -129,16 +139,16 @@ if OLD_GDID in src:
     src = src.replace(OLD_GDID, NEW_GDID, 1)
     report.append("✓ [B] _gDID 修复（掉激活根因）")
 else:
-    # 用正则兜底
+    # 用正则兜底 — 关键：replacement 用 lambda 包装，避免 \x 被解析为转义
     pat = re.compile(
         r'//\s*2\.\s*Only SpringBoard generates.*?return @"unknown";',
         re.DOTALL)
-    new_src, n = pat.subn(NEW_GDID, src, count=1)
+    new_src, n = pat.subn(lambda m: NEW_GDID, src, count=1)
     if n == 1:
         src = new_src
         report.append("✓ [B] _gDID 修复（正则命中）")
     else:
-        print("[!] _gDID 块未匹配", file=sys.stderr)
+        print("[!] _gDID 块未匹配（跳过，非致命）", file=sys.stderr)
 
 # =================================================================
 # C. 禁用 CRC 完整性检查（避免误判掉激活）
@@ -174,7 +184,7 @@ if OLD_INTEG in src:
     src = src.replace(OLD_INTEG, NEW_INTEG, 1)
     report.append("✓ [C] 禁用 CRC 完整性检查")
 else:
-    print("[!] _chkInteg 块未匹配（可忽略）", file=sys.stderr)
+    print("[!] _chkInteg 块未匹配（跳过，非致命）", file=sys.stderr)
 
 # =================================================================
 # D. UI 精简（正则锚定 + 行级回退）
@@ -197,10 +207,10 @@ NEW_UI = "\n" + "\n".join(NEW_UI_LINES)
 ui_pat = re.compile(
     r'\n    CGFloat iy = 54;\n.*?tag:9 x:\(cw - bw\) / 2 y:by w:bw h:bh\]\];',
     re.DOTALL)
-new_src, n = ui_pat.subn(NEW_UI, src, count=1)
+new_src, n = ui_pat.subn(lambda m: NEW_UI, src, count=1)
 if n == 1:
     src = new_src
-    report.append("✓ [D] UI 精简")
+    report.append("✓ [D] UI 精简（正则命中）")
 else:
     lines = src.split("\n")
     start = next((i for i, l in enumerate(lines) if "CGFloat iy = 54;" in l), None)
@@ -209,13 +219,13 @@ else:
         src = "\n".join(lines[:start] + NEW_UI_LINES + lines[end + 1:])
         report.append("✓ [D] UI 精简（行级回退）")
     else:
-        print("[!] UI 块未匹配", file=sys.stderr)
+        print("[!] UI 块未匹配（跳过）", file=sys.stderr)
 
 src = src.replace("CGFloat ch = 380;", "CGFloat ch = 260;")
 report.append("✓ [D] 卡片高度 380→260")
 
 # =================================================================
-# E. 镜像按钮 tag=10 + 隐藏已移除按钮
+# E. 镜像按钮 tag=10 + 隐藏已移除按钮 + 防重复弹层
 # =================================================================
 OLD_BTN = """    if (tag == 9) {
         [self dismissViewControllerAnimated:YES completion:nil];
@@ -267,8 +277,11 @@ if OLD_SM in src:
 # 写回
 # =================================================================
 if src == original:
-    print("[!] 无变更", file=sys.stderr); sys.exit(5)
+    print("[!] 无变更（可能源码版本不同）", file=sys.stderr)
+    sys.exit(5)
+
 TWEAK.write_text(src, encoding="utf-8")
 print(f"[+] 补丁成功：{TWEAK}")
-for r in report: print("   ", r)
+for r in report:
+    print("   ", r)
 print(f"[+] 共 {len(report)} 项")
